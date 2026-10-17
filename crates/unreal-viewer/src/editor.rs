@@ -123,6 +123,9 @@ struct Drag {
     start_hit: Vec3,
     vertical: bool,
     start: Placement,
+    /// Height added with the mouse wheel while the actor is held, in Unreal
+    /// units.
+    height: f32,
     active: bool,
 }
 
@@ -488,6 +491,7 @@ fn drag_selected_actor(
             start_hit: ray.get_point(distance),
             vertical,
             start,
+            height: 0.0,
             active: false,
         });
         return;
@@ -509,6 +513,7 @@ fn drag_selected_actor(
     };
     let delta = unreal_delta(ray.get_point(distance) - drag.start_hit);
     let mut location = drag.start.location;
+    location.z += drag.height;
     if drag.vertical {
         location.z = (location.z + delta.z).round();
     } else {
@@ -583,8 +588,13 @@ fn scroll_selected_height(
         return;
     };
     let mut placement = before;
-    placement.location.z += whole * editor.step;
-    if gesture.export != Some(export) || !continuing {
+    let lift = whole * editor.step;
+    placement.location.z += lift;
+    if let Some(drag) = editor.drag.as_mut().filter(|drag| drag.export == export) {
+        // Held: the drag keeps the height and undoes as one step on release.
+        drag.height += lift;
+        drag.active = true;
+    } else if gesture.export != Some(export) || !continuing {
         editor.undo.push(UndoStep::Moved(export, before));
     }
     gesture.export = Some(export);
