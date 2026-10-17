@@ -251,6 +251,154 @@ impl Package {
         self.rebuild_from_dumps(&edited)
     }
 
+    /// Adds an actor cloned from `addition.template` and registers it in the
+    /// level's actor list. Returns the plain package bytes and the new export
+    /// index. Existing name, import and export indices are unchanged, so every
+    /// reference elsewhere in the package stays valid.
+    pub fn add_actor(&self, addition: &ActorAddition) -> Result<(Vec<u8>, usize), String> {
+        let template = self
+            .exports
+            .get(addition.template)
+            .ok_or_else(|| format!("template export {} does not exist", addition.template))?;
+        let mut actor = self.export_dump(addition.template, template);
+        if actor.raw_data.is_some() || actor.native_object.is_some() || !actor.unread_data.is_empty()
+        {
+            return Err(format!(
+                "{} carries native data and cannot be used as an actor template",
+                actor.name
+            ));
+        }
+        let level_index = self
+            .exports
+            .iter()
+            .position(|export| self.object_path(export.class.reference) == "Engine.Level")
+            .ok_or("the package has no Engine.Level export")?;
+
+        let mut names = self.names.clone();
+        let mut imports = self.imports.clone();
+        let mut paths: Vec<String> = (0..self.imports.len())
+            .map(|index| {
+                self.object_path(ObjectRef::Import(crate::model::ImportIndex::from_usize(index)))
+            })
+            .collect();
+        if let Some(mesh) = &addition.static_mesh
+            && self.object_wire(mesh).is_err()
+        {
+            ensure_import_path(&mut names, &mut imports, &mut paths, mesh, "Engine.StaticMesh")?;
+        }
+        for name in ["Location", "Vector", "Rotation", "Rotator", "StaticMesh"] {
+            ensure_name(&mut names, name, "0x00070010")?;
+        }
+        let name_flags = format!("0x{:08x}", self.names[template.name.index.get()].flags);
+        let name = unique_actor_name(&names, &actor.name);
+        let name_index = ensure_name(&mut names, &name, &name_flags)?;
+
+        let mut exports = self.exports.clone();
+        let new_index = exports.len();
+        exports.push(Export {
+            name: compact_name_ref(name_index, names.len(), "new actor name")?,
+            size: 0,
+            offset: 0,
+            ..template.clone()
+        });
+        let mut package = Package {
+            path: self.path.clone(),
+            data: self.data.clone(),
+            version: self.version,
+            flags: self.flags,
+            names,
+            imports,
+            exports,
+        };
+
+        // Per-actor lighting and touch lists belong to the original actor.
+        actor
+            .properties
+            .retain(|property| !matches!(property.name.as_str(), "StaticMeshInstance" | "Touching"));
+        let template_location = actor
+            .properties
+            .iter()
+            .find(|property| property.name == "Location")
+            .map(|property| property.value.clone());
+        if let Some(mesh) = &addition.static_mesh {
+            package.set_property(&mut actor.properties, "StaticMesh", "Object", mesh)?;
+        }
+        // Lineage II's collision location keeps its offset from the actor.
+        if let Some(col_location) = actor
+            .properties
+            .iter()
+            .find(|property| property.name == "ColLocation")
+            .map(|property| property.value.clone())
+        {
+            let moved = offset_triplet(
+                &col_location,
+                template_location.as_deref().unwrap_or("0,0,0"),
+                &addition.location,
+            )?;
+            package.set_property(&mut actor.properties, "ColLocation", "Vector", &moved)?;
+        }
+        package.set_property(&mut actor.properties, "Location", "Vector", &addition.location)?;
+        package.set_property(&mut actor.properties, "Rotation", "Rotator", &addition.rotation)?;
+
+        let actor_offset = package.data.len();
+        let payload = package.encode_export(&actor, None, actor_offset)?;
+        package.data.extend_from_slice(&payload);
+        package.exports[new_index].offset = actor_offset;
+        package.exports[new_index].size = payload.len();
+
+        let level = &package.exports[level_index];
+        let (_, body_start, _) = package.properties(level)?;
+        let level_payload = level_with_actor(
+            &package.data[level.offset..level.offset + level.size],
+            body_start - level.offset,
+            i32::try_from(new_index + 1).map_err(|_| "export index exceeds i32")?,
+        )?;
+        let level_offset = package.data.len();
+        package.data.extend_from_slice(&level_payload);
+        package.exports[level_index].offset = level_offset;
+        package.exports[level_index].size = level_payload.len();
+
+        let bytes = package.rebuild_tables(
+            package.data.clone(),
+            package.names.clone(),
+            package.imports.clone(),
+            package.exports.clone(),
+        )?;
+        Ok((bytes, new_index))
+    }
+
+    /// Replaces or adds a tagged property of a dump being encoded as a new
+    /// export, encoding its raw value from `value`.
+    fn set_property(
+        &self,
+        properties: &mut Vec<PropertyDump>,
+        name: &str,
+        property_type: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        let mut property = PropertyDump {
+            name: name.into(),
+            property_type: property_type.into(),
+            array_index: 0,
+            size: 0,
+            value: value.into(),
+            raw: String::new(),
+            wire_header: String::new(),
+        };
+        let (kind, structure) = property_kind(property_type)?;
+        let raw = self.encode_property_value(&property, kind, structure)?;
+        property.size = raw.len();
+        property.raw = hex(&raw);
+        match properties
+            .iter_mut()
+            .find(|existing| existing.array_index == 0 && existing.name.eq_ignore_ascii_case(name))
+        {
+            Some(existing) => *existing = property,
+            None => properties.push(property),
+        }
+        Ok(())
+    }
+
     fn encode_export(
         &self,
         edited: &ExportDump,
@@ -1097,6 +1245,77 @@ pub struct PropertyDump {
     pub raw: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub wire_header: String,
+}
+
+/// A new actor cloned from an existing one in the same package.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActorAddition {
+    /// The actor whose class, outer and properties (level, zone, volume and
+    /// display settings) the new actor copies.
+    pub template: usize,
+    /// The static mesh object path to show instead of the template's.
+    pub static_mesh: Option<String>,
+    /// `X,Y,Z` in Unreal units.
+    pub location: String,
+    /// `Pitch,Yaw,Roll` in rotator units.
+    pub rotation: String,
+}
+
+/// The template's name with the lowest numeric suffix above every name in
+/// the table that shares its stem, e.g. `StaticMeshActor2019`.
+fn unique_actor_name(names: &[Name], template: &str) -> String {
+    let stem = template.trim_end_matches(|character: char| character.is_ascii_digit());
+    let highest = names
+        .iter()
+        .filter_map(|name| {
+            let suffix = name.value.get(stem.len()..)?;
+            name.value[..stem.len()]
+                .eq_ignore_ascii_case(stem)
+                .then(|| suffix.parse::<u64>().ok())
+                .flatten()
+        })
+        .max();
+    format!("{stem}{}", highest.map_or(0, |value| value + 1))
+}
+
+/// `value` moved by the difference between two `X,Y,Z` locations.
+fn offset_triplet(value: &str, from: &str, to: &str) -> Result<String, String> {
+    let parse = |text: &str| -> Result<Vec<f32>, String> {
+        let parts = text
+            .split(',')
+            .map(|part| part.trim().parse::<f32>().map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        (parts.len() == 3)
+            .then_some(parts)
+            .ok_or_else(|| format!("expected X,Y,Z but got {text:?}"))
+    };
+    let (value, from, to) = (parse(value)?, parse(from)?, parse(to)?);
+    Ok((0..3)
+        .map(|axis| (value[axis] + to[axis] - from[axis]).to_string())
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+/// A level export's payload with one more actor reference: its tagged
+/// properties, then the actor array (capacity, count, compact references),
+/// then everything after it unchanged.
+fn level_with_actor(payload: &[u8], body_start: usize, actor_wire: i32) -> Result<Vec<u8>, String> {
+    let mut cursor = Cursor::new(payload, body_start, payload.len());
+    let capacity = cursor.i32()?;
+    let count = cursor.i32()?;
+    for _ in 0..count {
+        cursor.compact()?;
+    }
+    let references_end = cursor.pos;
+    let mut level = payload[..body_start].to_vec();
+    level.extend_from_slice(&capacity.max(count + 1).to_le_bytes());
+    level.extend_from_slice(&(count + 1).to_le_bytes());
+    level.extend_from_slice(&payload[body_start + 8..references_end]);
+    let mut writer = BinaryWriter::default();
+    writer.compact(actor_wire);
+    level.extend_from_slice(&writer.into_bytes());
+    level.extend_from_slice(&payload[references_end..]);
+    Ok(level)
 }
 
 /// A replacement value for one tagged property of an export.
@@ -2279,6 +2498,183 @@ mod tests {
         assert_eq!(properties[1].value, "0,16384,-512");
         // A struct tag: kind 10 with a 12-byte size code, then the struct name.
         assert_eq!(properties[1].wire_header, "093a0a");
+    }
+
+    /// A minimal map: one `Engine.StaticMeshActor` and an `Engine.Level`
+    /// whose actor list holds it, followed by trailing level data.
+    fn map_test_package() -> Vec<u8> {
+        let names = [
+            "None",
+            "Core",
+            "Package",
+            "Class",
+            "Engine",
+            "StaticMeshActor",
+            "StaticMeshActor7",
+            "Location",
+            "Vector",
+            "Level",
+            "MyLevel",
+            "ColLocation",
+            "StaticMeshInstance",
+            "Object",
+        ];
+        let mut name_table = Vec::new();
+        for name in names {
+            write_unreal_string(&mut name_table, name).unwrap();
+            name_table.extend_from_slice(&0x0007_0010u32.to_le_bytes());
+        }
+        let mut import_table = BinaryWriter::default();
+        // Engine (package), Engine.StaticMeshActor, Engine.Level (classes).
+        for (class_name, outer, name) in [(2, 0, 4), (3, -1, 5), (3, -1, 9)] {
+            import_table.compact(1);
+            import_table.compact(class_name);
+            import_table.i32(outer);
+            import_table.compact(name);
+        }
+        let vector = |writer: &mut BinaryWriter, name: i32, value: [f32; 3]| {
+            writer.compact(name);
+            writer.u8(0x3a);
+            writer.compact(8);
+            for axis in value {
+                writer.bytes(&axis.to_le_bytes());
+            }
+        };
+        let mut actor = BinaryWriter::default();
+        vector(&mut actor, 7, [100.0, 200.0, 300.0]);
+        vector(&mut actor, 11, [100.0, 200.0, 340.0]);
+        // StaticMeshInstance pointing at the level, standing in for the
+        // per-actor lighting object the copy must not share.
+        actor.compact(12);
+        actor.u8(0x05);
+        actor.compact(2);
+        actor.compact(0);
+        let mut level = BinaryWriter::default();
+        level.compact(0);
+        level.i32(1);
+        level.i32(1);
+        level.compact(1);
+        level.bytes(&[0xaa, 0xbb, 0xcc]);
+        let (import_table, actor, level) =
+            (import_table.into_bytes(), actor.into_bytes(), level.into_bytes());
+
+        let name_offset = 64;
+        let import_offset = name_offset + name_table.len();
+        let actor_offset = import_offset + import_table.len();
+        let level_offset = actor_offset + actor.len();
+        let export_offset = level_offset + level.len();
+        let mut export_table = BinaryWriter::default();
+        for (class, name, payload, offset) in [
+            (-2, 6, &actor, actor_offset),
+            (-3, 10, &level, level_offset),
+        ] {
+            export_table.compact(class);
+            export_table.compact(0);
+            export_table.i32(0);
+            export_table.compact(name);
+            export_table.u32(0);
+            export_table.compact(payload.len() as i32);
+            export_table.compact(offset as i32);
+        }
+
+        let mut data = MAGIC.to_le_bytes().to_vec();
+        data.extend_from_slice(&123u16.to_le_bytes());
+        data.extend_from_slice(&37u16.to_le_bytes());
+        for value in [0, names.len(), name_offset, 2, export_offset, 3, import_offset] {
+            data.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        data.resize(name_offset, 0);
+        data.extend_from_slice(&name_table);
+        data.extend_from_slice(&import_table);
+        data.extend_from_slice(&actor);
+        data.extend_from_slice(&level);
+        data.extend_from_slice(&export_table.into_bytes());
+        data
+    }
+
+    #[test]
+    fn added_actor_is_cloned_placed_and_listed_in_the_level() {
+        let original = map_test_package();
+        let package = Package::from_wire_bytes(Path::new("map.unr"), original).unwrap();
+        let (bytes, index) = package
+            .add_actor(&ActorAddition {
+                template: 0,
+                static_mesh: None,
+                location: "164,-56.5,300".into(),
+                rotation: "0,16384,0".into(),
+            })
+            .unwrap();
+        assert_eq!(index, 2);
+
+        let reread = Package::from_wire_bytes(Path::new("map.unr"), bytes).unwrap();
+        let dump = reread.dump();
+        assert_eq!(dump.exports.len(), 3);
+        let added = &dump.exports[2];
+        assert_eq!(added.name, "StaticMeshActor8");
+        assert_eq!(added.class, "Engine.StaticMeshActor");
+        let value = |name: &str| {
+            added
+                .properties
+                .iter()
+                .find(|property| property.name == name)
+                .map(|property| property.value.clone())
+        };
+        assert_eq!(value("Location").as_deref(), Some("164,-56.5,300"));
+        assert_eq!(value("ColLocation").as_deref(), Some("164,-56.5,340"));
+        assert_eq!(value("Rotation").as_deref(), Some("0,16384,0"));
+        assert_eq!(value("StaticMeshInstance"), None);
+        // The template is untouched.
+        assert_eq!(dump.exports[0].properties.len(), 3);
+
+        let Some(NativeObject::Level(level)) = &dump.exports[1].native_object else {
+            panic!("level did not decode");
+        };
+        let actors: Vec<_> = level.actors.iter().map(|actor| actor.path.as_str()).collect();
+        assert_eq!(actors, ["StaticMeshActor7", "StaticMeshActor8"]);
+        assert_eq!(level.trailing_data, [0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn added_actor_imports_a_static_mesh_from_another_package() {
+        let package =
+            Package::from_wire_bytes(Path::new("map.unr"), map_test_package()).unwrap();
+        let (bytes, index) = package
+            .add_actor(&ActorAddition {
+                template: 0,
+                static_mesh: Some("Aden_Village_S.Group.Aden_Platform01".into()),
+                location: "0,0,0".into(),
+                rotation: "0,0,0".into(),
+            })
+            .unwrap();
+        let dump = Package::from_wire_bytes(Path::new("map.unr"), bytes)
+            .unwrap()
+            .dump();
+        let mesh = dump.exports[index]
+            .properties
+            .iter()
+            .find(|property| property.name == "StaticMesh")
+            .unwrap();
+        assert_eq!(mesh.value, "Aden_Village_S.Group.Aden_Platform01");
+        let import = dump
+            .imports
+            .iter()
+            .find(|import| import.full_name == "Aden_Village_S.Group.Aden_Platform01")
+            .unwrap();
+        assert_eq!(import.class, "Engine.StaticMesh");
+    }
+
+    #[test]
+    fn new_actor_names_continue_the_highest_numbered_name() {
+        let names: Vec<_> = ["StaticMeshActor", "staticmeshactor2017", "StaticMeshActor9", "Light4"]
+            .into_iter()
+            .map(|value| Name {
+                value: value.into(),
+                flags: 0,
+            })
+            .collect();
+        assert_eq!(unique_actor_name(&names, "StaticMeshActor9"), "StaticMeshActor2018");
+        assert_eq!(unique_actor_name(&names, "Light4"), "Light5");
+        assert_eq!(unique_actor_name(&names, "Emitter3"), "Emitter0");
     }
 
     #[test]

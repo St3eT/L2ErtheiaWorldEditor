@@ -28,6 +28,7 @@ impl Plugin for MapEditorPlugin {
                     drag_selected_actor.before(runtime::select_rendered_object),
                     finish_drag.after(runtime::select_rendered_object),
                     press_editor_buttons,
+                    scroll_selected_height,
                     editor_shortcuts,
                     show_editor_panel.after(press_editor_buttons),
                     draw_selection_axes,
@@ -363,6 +364,65 @@ fn finish_drag(buttons: Res<ButtonInput<MouseButton>>, mut editor: ResMut<MapEdi
     if let Some(drag) = editor.drag.take().filter(|drag| drag.active) {
         editor.undo.push((drag.export, drag.start));
     }
+}
+
+/// Seconds between wheel notches that still count as the same height change,
+/// so one spin of the wheel undoes as one step.
+const WHEEL_GESTURE_GAP: f32 = 0.6;
+/// Pixels of touchpad scrolling that count as one wheel notch.
+const PIXELS_PER_NOTCH: f32 = 40.0;
+
+#[derive(Default)]
+struct WheelGesture {
+    export: Option<usize>,
+    pending: f32,
+    last: f32,
+}
+
+/// Raises or lowers the selection by one step per mouse wheel notch.
+fn scroll_selected_height(
+    view: SelectionView,
+    scroll: Res<AccumulatedMouseScroll>,
+    time: Res<Time>,
+    scene: Res<MapScene>,
+    mut editor: ResMut<MapEditor>,
+    mut parts: Query<(Entity, &mut Transform, &mut SelectableObject)>,
+    mut gesture: Local<WheelGesture>,
+) {
+    let Some(export) = editor.selected else {
+        return;
+    };
+    if scroll.delta.y == 0.0 || menus_open(&view) || editor.pointer_over_panel {
+        return;
+    }
+    let notches = match scroll.unit {
+        bevy::input::mouse::MouseScrollUnit::Line => scroll.delta.y,
+        bevy::input::mouse::MouseScrollUnit::Pixel => scroll.delta.y / PIXELS_PER_NOTCH,
+    };
+    let now = time.elapsed_secs();
+    let continuing =
+        gesture.export == Some(export) && now - gesture.last <= WHEEL_GESTURE_GAP;
+    if !continuing {
+        gesture.pending = 0.0;
+    }
+    gesture.pending += notches;
+    gesture.last = now;
+    let whole = gesture.pending.trunc();
+    if whole == 0.0 {
+        return;
+    }
+    gesture.pending -= whole;
+    let Some(before) = editor.placement(export) else {
+        return;
+    };
+    let mut placement = before;
+    placement.location.z += whole * editor.step;
+    if gesture.export != Some(export) || !continuing {
+        editor.undo.push((export, before));
+    }
+    gesture.export = Some(export);
+    editor.set_placement(export, placement);
+    apply_placement(&mut parts, scene.origin, export, placement);
 }
 
 /// Keyboard chords kept alongside the panel buttons.
@@ -842,7 +902,7 @@ fn editor_summary(editor: &MapEditor) -> String {
         count => format!("{count} unsaved changes"),
     };
     let mut summary = format!(
-        "EDITOR - {changes}\nClick a placed mesh to edit it; drag it to move, Alt+drag for height. Ctrl+Z undo, Ctrl+S save."
+        "EDITOR - {changes}\nClick a placed mesh to edit it; drag it to move, mouse wheel or Alt+drag for height. Ctrl+Z undo, Ctrl+S save."
     );
     if !editor.status.is_empty() {
         summary.push('\n');
@@ -997,6 +1057,63 @@ mod tests {
             rotation: IVec3::new(0, 1000, 0),
         };
         assert_eq!(rotated(placement, -16384).rotation.y, 65536 - 15384);
+    }
+
+    #[test]
+    #[ignore = "requires LINEAGE2_CLIENT to point to a complete client"]
+    fn adding_an_actor_to_an_encrypted_lineage_map_shows_it_in_the_level() {
+        use unreal_package::unreal::ActorAddition;
+        let client = PathBuf::from(
+            std::env::var_os("LINEAGE2_CLIENT").expect("LINEAGE2_CLIENT is not configured"),
+        );
+        let wire = fs::read(client.join("Maps/24_18.unr")).unwrap();
+        let package = Package::from_wire_bytes(Path::new("24_18.unr"), wire.clone()).unwrap();
+        let level_actors = |package: &Package| {
+            package
+                .dump()
+                .exports
+                .into_iter()
+                .find_map(|export| match export.native_object {
+                    Some(NativeObject::Level(level)) => Some(level.actors.len()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let before = level_actors(&package);
+        let gate = package
+            .dump()
+            .exports
+            .iter()
+            .position(|export| export.name == "StaticMeshActor1")
+            .unwrap();
+        let (plain, index) = package
+            .add_actor(&ActorAddition {
+                template: gate,
+                static_mesh: None,
+                location: "147456,5900,5776".into(),
+                rotation: "0,32768,0".into(),
+            })
+            .unwrap();
+        let saved = reencrypt_like(&wire, plain, "24_18.unr").unwrap();
+
+        let directory = std::env::temp_dir().join(format!(
+            "unreal-viewer-editor-add-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let map = directory.join("24_18.unr");
+        fs::write(&map, &saved).unwrap();
+        let reread = Package::read(&map).unwrap();
+        assert_eq!(level_actors(&reread), before + 1);
+        let (scene, _) = load_scene(&map, &[]).unwrap();
+        let copy = scene
+            .instances
+            .iter()
+            .find_map(|instance| instance.source.filter(|source| source.export == index))
+            .unwrap();
+        assert_eq!(copy.location, Vec3::new(147456.0, 5900.0, 5776.0));
+        assert_eq!(copy.rotation, IVec3::new(0, 32768, 0));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
