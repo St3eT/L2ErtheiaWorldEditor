@@ -1606,7 +1606,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires LINEAGE2_CLIENT to point to a complete client"]
-    fn adding_an_actor_to_an_encrypted_lineage_map_shows_it_in_the_level() {
+    fn adding_an_actor_to_an_encrypted_lineage_map_keeps_the_ambient_sound_list() {
         use unreal_package::unreal::ActorAddition;
         let client = PathBuf::from(
             std::env::var_os("LINEAGE2_CLIENT").expect("LINEAGE2_CLIENT is not configured"),
@@ -1649,7 +1649,10 @@ mod tests {
         let map = directory.join("24_18.unr");
         fs::write(&map, &saved).unwrap();
         let reread = Package::read(&map).unwrap();
-        assert_eq!(level_actors(&reread), before + 1);
+        // That list is the level's ambient sounds; the client crashes if a
+        // mesh actor is added to it.
+        assert_eq!(level_actors(&reread), before);
+        assert_eq!(reread.export_count(), package.export_count() + 1);
         let (scene, _) = load_scene(&map, &[]).unwrap();
         let copy = scene
             .instances
@@ -1796,3 +1799,5 @@ mod tests {
         );
     }
 }
+
+

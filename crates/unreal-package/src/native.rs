@@ -489,6 +489,8 @@ pub struct MeshSocket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Level {
+    /// The array after a level's tagged properties. In Lineage II maps it
+    /// lists the level's AmbientSoundObjects, not every actor.
     pub actors: Vec<ObjectLink>,
     pub trailing_data: Vec<u8>,
 }

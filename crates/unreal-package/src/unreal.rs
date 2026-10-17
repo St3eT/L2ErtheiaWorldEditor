@@ -251,10 +251,15 @@ impl Package {
         self.rebuild_from_dumps(&edited)
     }
 
-    /// Adds an actor cloned from `addition.template` and registers it in the
-    /// level's actor list. Returns the plain package bytes and the new export
-    /// index. Existing name, import and export indices are unchanged, so every
-    /// reference elsewhere in the package stays valid.
+    /// Adds an actor cloned from `addition.template`, owned by the same level.
+    /// Returns the plain package bytes and the new export index. Existing name,
+    /// import and export indices are unchanged, so every reference elsewhere in
+    /// the package stays valid.
+    ///
+    /// Lineage II levels keep no serialized list of all actors: the array
+    /// after a level's properties lists only its AmbientSoundObjects, and the
+    /// client crashes in its ambient sound update if other actors are put
+    /// there. The level payload is therefore left untouched.
     pub fn add_actor(&self, addition: &ActorAddition) -> Result<(Vec<u8>, usize), String> {
         let template = self
             .exports
@@ -268,12 +273,6 @@ impl Package {
                 actor.name
             ));
         }
-        let level_index = self
-            .exports
-            .iter()
-            .position(|export| self.object_path(export.class.reference) == "Engine.Level")
-            .ok_or("the package has no Engine.Level export")?;
-
         let mut names = self.names.clone();
         let mut imports = self.imports.clone();
         let mut paths: Vec<String> = (0..self.imports.len())
@@ -345,18 +344,6 @@ impl Package {
         package.data.extend_from_slice(&payload);
         package.exports[new_index].offset = actor_offset;
         package.exports[new_index].size = payload.len();
-
-        let level = &package.exports[level_index];
-        let (_, body_start, _) = package.properties(level)?;
-        let level_payload = level_with_actor(
-            &package.data[level.offset..level.offset + level.size],
-            body_start - level.offset,
-            i32::try_from(new_index + 1).map_err(|_| "export index exceeds i32")?,
-        )?;
-        let level_offset = package.data.len();
-        package.data.extend_from_slice(&level_payload);
-        package.exports[level_index].offset = level_offset;
-        package.exports[level_index].size = level_payload.len();
 
         let bytes = package.rebuild_tables(
             package.data.clone(),
@@ -1294,28 +1281,6 @@ fn offset_triplet(value: &str, from: &str, to: &str) -> Result<String, String> {
         .map(|axis| (value[axis] + to[axis] - from[axis]).to_string())
         .collect::<Vec<_>>()
         .join(","))
-}
-
-/// A level export's payload with one more actor reference: its tagged
-/// properties, then the actor array (capacity, count, compact references),
-/// then everything after it unchanged.
-fn level_with_actor(payload: &[u8], body_start: usize, actor_wire: i32) -> Result<Vec<u8>, String> {
-    let mut cursor = Cursor::new(payload, body_start, payload.len());
-    let capacity = cursor.i32()?;
-    let count = cursor.i32()?;
-    for _ in 0..count {
-        cursor.compact()?;
-    }
-    let references_end = cursor.pos;
-    let mut level = payload[..body_start].to_vec();
-    level.extend_from_slice(&capacity.max(count + 1).to_le_bytes());
-    level.extend_from_slice(&(count + 1).to_le_bytes());
-    level.extend_from_slice(&payload[body_start + 8..references_end]);
-    let mut writer = BinaryWriter::default();
-    writer.compact(actor_wire);
-    level.extend_from_slice(&writer.into_bytes());
-    level.extend_from_slice(&payload[references_end..]);
-    Ok(level)
 }
 
 /// A replacement value for one tagged property of an export.
@@ -2593,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn added_actor_is_cloned_placed_and_listed_in_the_level() {
+    fn added_actor_is_cloned_and_placed_without_touching_the_level() {
         let original = map_test_package();
         let package = Package::from_wire_bytes(Path::new("map.unr"), original).unwrap();
         let (bytes, index) = package
@@ -2626,12 +2591,15 @@ mod tests {
         // The template is untouched.
         assert_eq!(dump.exports[0].properties.len(), 3);
 
+        // The level's array holds ambient sound objects in Lineage II, so it
+        // keeps exactly what it had.
         let Some(NativeObject::Level(level)) = &dump.exports[1].native_object else {
             panic!("level did not decode");
         };
-        let actors: Vec<_> = level.actors.iter().map(|actor| actor.path.as_str()).collect();
-        assert_eq!(actors, ["StaticMeshActor7", "StaticMeshActor8"]);
+        let listed: Vec<_> = level.actors.iter().map(|actor| actor.path.as_str()).collect();
+        assert_eq!(listed, ["StaticMeshActor7"]);
         assert_eq!(level.trailing_data, [0xaa, 0xbb, 0xcc]);
+        assert_eq!(added.outer, dump.exports[0].outer);
     }
 
     #[test]
