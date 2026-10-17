@@ -27,6 +27,11 @@ impl MapScene {
             .collect();
         let mut bsp = Vec::new();
         for export in exports {
+            // Actors deleted in the editor stay in the package flagged for
+            // deletion; the game never spawns them.
+            if flag(&export.properties, "bDeleteMe") {
+                continue;
+            }
             let material = material_geometry("", &export);
             if export.class == "Engine.PlayerStart"
                 && let Some(location) = property(&export.properties, "Location")
@@ -1301,8 +1306,9 @@ fn bone_transform(
 }
 
 fn unreal_quaternion(value: &unreal_package::native::Quaternion) -> Quat {
-    let basis = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-    (basis * Quat::from_xyzw(value.x, value.y, value.z, value.w) * basis.inverse()).normalize()
+    // Seen through the Y/Z reflection, a rotation turns about the reflected
+    // axis in the opposite direction.
+    Quat::from_xyzw(-value.x, -value.z, -value.y, value.w).normalize()
 }
 
 fn bsp_geometry(bytes: &[u8], object_paths: &HashMap<i32, String>) -> Result<MeshGeometry, String> {
@@ -2509,7 +2515,7 @@ fn triplet(value: &str) -> Option<Vec3> {
 }
 
 fn unreal_point(value: Vector3) -> [f32; 3] {
-    [value.x, value.z, -value.y]
+    unreal_direction_vec(Vec3::new(value.x, value.y, value.z)).to_array()
 }
 
 fn unreal_direction(value: &Vector3) -> Vec3 {
@@ -2517,7 +2523,10 @@ fn unreal_direction(value: &Vector3) -> Vec3 {
 }
 
 pub(super) fn unreal_direction_vec(value: Vec3) -> Vec3 {
-    Vec3::new(value.x, value.z, -value.y)
+    // Unreal is left-handed with Z up; Bevy is right-handed with Y up. Swapping
+    // Y and Z is a reflection, so the world is not mirrored, and it is its own
+    // inverse: it also converts viewer coordinates back to Unreal ones.
+    Vec3::new(value.x, value.z, value.y)
 }
 
 fn unreal_color(value: UnrealColor) -> [f32; 4] {

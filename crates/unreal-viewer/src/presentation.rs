@@ -3,7 +3,7 @@ use crate::combiner::{CombinedMaterial, CombinedMaterials, combined_material};
 use crate::scene::{
     PF_AUTO_U_PAN, PF_AUTO_V_PAN, masked_texture_image, material_cull_mode, opaque_texture_image,
     projector_transform, radar_atlas_image, repeating_texture_image, resolve_texture,
-    self_illumination_image, standard_material, texture_frames,
+    self_illumination_image, standard_material, texture_frames, unreal_direction_vec,
 };
 use crate::terrain::{LoadedTerrainLayer, TerrainMaterial, layer_repeats, terrain_extension};
 use bevy::light::NotShadowCaster;
@@ -259,12 +259,12 @@ fn setup(
         hit_index: 0,
     });
     if let Some(terrain) = &scene.terrain {
-        let indices = terrain_indices(
+        let indices = reflected_winding(&terrain_indices(
             terrain.width,
             terrain.height,
             &terrain.quad_visibility,
             &terrain.edge_turns,
-        );
+        ));
         let positions: Vec<_> = terrain
             .positions
             .iter()
@@ -301,7 +301,7 @@ fn setup(
                     .layers
                     .first()
                     .map(|layer| layer.texture.clone()),
-                unreal_location: Vec3::new(scene.origin.x, -scene.origin.z, scene.origin.y),
+                unreal_location: unreal_direction_vec(scene.origin),
                 export: None,
             },
             RayCastBackfaces,
@@ -437,7 +437,7 @@ fn setup(
                             skin.joint_weights.clone(),
                         );
                     }
-                    mesh.insert_indices(Indices::U32(part.indices.clone()));
+                    mesh.insert_indices(Indices::U32(reflected_winding(&part.indices)));
                     (meshes.add(mesh), part.material.clone())
                 })
                 .collect::<Vec<_>>()
@@ -516,11 +516,7 @@ fn setup(
                     actor: instance.name.clone(),
                     object: instance.mesh.clone(),
                     material: material_name.clone(),
-                    unreal_location: Vec3::new(
-                        instance.location.x,
-                        -instance.location.z,
-                        instance.location.y,
-                    ),
+                    unreal_location: unreal_direction_vec(instance.location),
                     // Skinned parts follow their skeleton, so only rigid
                     // meshes are moved by the editor.
                     export: instance
@@ -566,7 +562,7 @@ fn setup(
             );
             mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, geometry.normals.clone());
             mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, geometry.uvs.clone());
-            mesh.insert_indices(Indices::U32(part.indices.clone()));
+            mesh.insert_indices(Indices::U32(reflected_winding(&part.indices)));
             let material = part
                 .material
                 .as_ref()
@@ -581,7 +577,7 @@ fn setup(
                     actor: format!("BSP model {geometry_index}"),
                     object: "Engine.Model".into(),
                     material: part.material.clone(),
-                    unreal_location: Vec3::new(scene.origin.x, -scene.origin.z, scene.origin.y),
+                    unreal_location: unreal_direction_vec(scene.origin),
                     export: None,
                 },
                 RayCastBackfaces,
@@ -639,7 +635,7 @@ fn setup(
                 );
                 mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, geometry.normals.clone());
                 mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, geometry.uvs.clone());
-                mesh.insert_indices(Indices::U32(part.indices.clone()));
+                mesh.insert_indices(Indices::U32(reflected_winding(&part.indices)));
                 let material = part.material.as_ref().and_then(|name| {
                     let name = name.to_ascii_lowercase();
                     if let Some(material) = sky_materials.get(&name) {

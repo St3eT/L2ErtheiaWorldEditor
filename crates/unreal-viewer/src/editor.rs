@@ -216,7 +216,7 @@ fn viewer_rotation(rotation: IVec3) -> Quat {
 
 /// Converts a displacement in viewer metres to Unreal units.
 fn unreal_delta(delta: Vec3) -> Vec3 {
-    Vec3::new(delta.x, -delta.z, delta.y) * UNREAL_UNITS_PER_METER
+    scene::unreal_direction_vec(delta) * UNREAL_UNITS_PER_METER
 }
 
 fn menus_open(view: &SelectionView) -> bool {
@@ -423,7 +423,7 @@ fn draw_selection_axes(scene: Res<MapScene>, editor: Res<MapEditor>, mut gizmos:
     let length = 3.0;
     // Unreal X, Y and Z in red, green and blue.
     gizmos.arrow(origin, origin + Vec3::X * length, Color::srgb(1.0, 0.2, 0.2));
-    gizmos.arrow(origin, origin - Vec3::Z * length, Color::srgb(0.2, 1.0, 0.2));
+    gizmos.arrow(origin, origin + Vec3::Z * length, Color::srgb(0.2, 1.0, 0.2));
     gizmos.arrow(origin, origin + Vec3::Y * length, Color::srgb(0.3, 0.5, 1.0));
 }
 
@@ -623,7 +623,7 @@ mod tests {
     fn viewer_drag_deltas_map_back_to_unreal_axes() {
         assert_eq!(
             unreal_delta(Vec3::new(1.0, 2.0, -3.0)),
-            Vec3::new(128.0, 384.0, 256.0)
+            Vec3::new(128.0, -384.0, 256.0)
         );
     }
 }

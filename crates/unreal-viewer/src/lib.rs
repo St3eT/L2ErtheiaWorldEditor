@@ -1090,10 +1090,25 @@ fn sample_segment(times: &[f32], value_count: usize, time: f32) -> (usize, usize
     (left, right, ((time - times[left]) / span).clamp(0.0, 1.0))
 }
 
+/// Converts an Unreal rotator (pitch, yaw, roll in radians) to the viewer.
+/// The Y/Z reflection reverses yaw and roll, which turn through the
+/// reflected axis; pitch turns X towards Z and keeps its sense.
 fn unreal_rotation(rotation: Vec3) -> Quat {
-    Quat::from_rotation_y(rotation.y)
+    Quat::from_rotation_y(-rotation.y)
         * Quat::from_rotation_z(rotation.x)
-        * Quat::from_rotation_x(rotation.z)
+        * Quat::from_rotation_x(-rotation.z)
+}
+
+/// Triangles from Unreal data reach the viewer through a reflection, which
+/// reverses their winding; swapping two corners restores which side faces out.
+fn reflected_winding(indices: &[u32]) -> Vec<u32> {
+    indices
+        .chunks(3)
+        .flat_map(|triangle| match *triangle {
+            [a, b, c] => vec![a, c, b],
+            ref partial => partial.to_vec(),
+        })
+        .collect()
 }
 
 fn smooth_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
@@ -1227,7 +1242,7 @@ fn selection_description(selected: &SelectableObject) -> String {
 
 fn camera_unreal_coordinates(viewer_position: Vec3, scene_origin: Vec3) -> Vec3 {
     let absolute = viewer_position * UNREAL_UNITS_PER_METER + scene_origin;
-    Vec3::new(absolute.x, -absolute.z, absolute.y)
+    scene::unreal_direction_vec(absolute)
 }
 
 #[cfg(test)]
@@ -1380,14 +1395,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(terrain.positions.len(), 4);
-        assert_eq!(terrain.positions[0], [2.0, 0.0, -6.0]);
-        assert_eq!(terrain.positions[3], [4.0, 3.0, -9.0]);
+        assert_eq!(terrain.positions[0], [2.0, 0.0, 6.0]);
+        assert_eq!(terrain.positions[3], [4.0, 3.0, 9.0]);
     }
 
     #[test]
     fn unreal_yaw_rotates_x_toward_mapped_y() {
         let rotation = unreal_rotation(Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0));
-        assert!(rotation.mul_vec3(Vec3::X).distance(Vec3::NEG_Z) < 0.000_001);
+        // Unreal Y maps to viewer Z.
+        assert!(rotation.mul_vec3(Vec3::X).distance(Vec3::Z) < 0.000_001);
+    }
+
+    #[test]
+    fn unreal_pitch_raises_x_toward_up() {
+        let rotation = unreal_rotation(Vec3::new(std::f32::consts::FRAC_PI_2, 0.0, 0.0));
+        assert!(rotation.mul_vec3(Vec3::X).distance(Vec3::Y) < 0.000_001);
+    }
+
+    #[test]
+    fn reflected_winding_swaps_two_corners_of_every_triangle() {
+        assert_eq!(reflected_winding(&[0, 1, 2, 3, 4, 5]), [0, 2, 1, 3, 5, 4]);
     }
 
     #[test]
@@ -2316,7 +2343,7 @@ mod tests {
         let decal = scene_decal(&export).unwrap();
 
         assert_eq!(decal.material, "Effects.footprint");
-        assert_eq!(decal.location, Vec3::new(128.0, 384.0, -256.0));
+        assert_eq!(decal.location, Vec3::new(128.0, 384.0, 256.0));
         let expected_width = 2.0 * 512.0 * (30.0_f32.to_radians()).tan();
         assert!((decal.scale.x - expected_width).abs() < 0.001);
         assert!((decal.scale.y - expected_width).abs() < 0.001);
@@ -2325,7 +2352,7 @@ mod tests {
         let transform = projector_transform(&decal, Vec3::ZERO);
         let projection_direction = transform.rotation * Vec3::NEG_Z;
         assert!(projection_direction.distance(Vec3::X) < 0.000_001);
-        assert!(transform.translation.distance(Vec3::new(3.0, 3.0, -2.0)) < 0.000_001);
+        assert!(transform.translation.distance(Vec3::new(3.0, 3.0, 2.0)) < 0.000_001);
     }
 
     #[test]
@@ -2345,8 +2372,8 @@ mod tests {
     #[test]
     fn camera_readout_uses_absolute_unreal_coordinates() {
         let coordinates = camera_unreal_coordinates(
-            Vec3::new(2.0, 3.0, -4.0),
-            Vec3::new(1_000.0, 2_000.0, -3_000.0),
+            Vec3::new(2.0, 3.0, 4.0),
+            Vec3::new(1_000.0, 2_000.0, 3_000.0),
         );
         assert_eq!(coordinates, Vec3::new(1_256.0, 3_512.0, 2_384.0));
     }

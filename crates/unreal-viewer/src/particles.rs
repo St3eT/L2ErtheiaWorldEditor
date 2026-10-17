@@ -168,11 +168,7 @@ pub(super) fn spawn_particle_systems(
                 actor: effect.name.clone(),
                 object: "Engine.Emitter".into(),
                 material: definition.texture.clone(),
-                unreal_location: Vec3::new(
-                    effect.location.x,
-                    -effect.location.z,
-                    effect.location.y,
-                ),
+                unreal_location: unreal_direction_vec(effect.location),
                 export: None,
             },
             RayCastBackfaces,
