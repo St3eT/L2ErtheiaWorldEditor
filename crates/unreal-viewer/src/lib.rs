@@ -29,6 +29,7 @@ use unreal_package::native::{
 use unreal_package::unreal::{ExportDump, Package, PropertyDump};
 
 mod combiner;
+mod editor;
 mod particles;
 mod presentation;
 mod runtime;
@@ -40,6 +41,8 @@ use runtime::ViewerRuntimePlugin;
 use scene::{asset_roots, texture_geometry};
 
 const UNREAL_UNITS_PER_METER: f32 = 128.0;
+/// Fly-camera speed in metres per second; left Shift multiplies it by four.
+const DEFAULT_MOVE_SPEED: f32 = 4.0;
 const RADAR_PAGE_SIZE: usize = 1024;
 const RADAR_COLUMNS: usize = 5;
 const RADAR_ROWS: usize = 4;
@@ -86,9 +89,12 @@ fn run_map(path: &Path, asset_paths: &[PathBuf]) -> Result<Option<PathBuf>, Stri
                     None
                 }
             });
+    let wire = fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let editor = editor::MapEditor::new(path, wire, &scene.instances);
     let next_map = Arc::new(Mutex::new(None));
     let mut app = App::new();
     app.insert_resource(scene)
+        .insert_resource(editor)
         .insert_resource(MapNavigation {
             maps_dir,
             radar,
@@ -106,6 +112,7 @@ fn run_map(path: &Path, asset_paths: &[PathBuf]) -> Result<Option<PathBuf>, Stri
         .add_plugins(terrain::TerrainPlugin)
         .add_plugins(ViewerPresentationPlugin)
         .add_plugins(ViewerRuntimePlugin)
+        .add_plugins(editor::MapEditorPlugin)
         .run();
     let selected = take_next_map(&next_map)?;
     Ok(selected)
@@ -595,6 +602,17 @@ struct MeshInstance {
     rotation: Vec3,
     scale: Vec3,
     material_override: MaterialOverride,
+    source: Option<ActorSource>,
+}
+
+/// Where a placed actor's editable placement lives in its package, in Unreal
+/// coordinates and rotator units as serialized.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ActorSource {
+    export: usize,
+    location: Vec3,
+    rotation: IVec3,
+    col_location: Option<Vec3>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -981,6 +999,8 @@ struct SelectableObject {
     object: String,
     material: Option<String>,
     unreal_location: Vec3,
+    /// The package export the map editor moves when this surface is dragged.
+    export: Option<usize>,
 }
 
 #[derive(Resource)]
@@ -1531,6 +1551,7 @@ mod tests {
                 rotation: Vec3::ZERO,
                 scale: Vec3::ONE,
                 material_override: MaterialOverride::default(),
+                source: None,
             },
             MeshInstance {
                 name: "second".into(),
@@ -1539,6 +1560,7 @@ mod tests {
                 rotation: Vec3::ZERO,
                 scale: Vec3::ONE,
                 material_override: MaterialOverride::default(),
+                source: None,
             },
         ];
         let (center, radius) = scene_extent(&None, &instances);
@@ -2310,6 +2332,7 @@ mod tests {
             object: "SSQ_dungeon_S.Broken_SSQ.fx_redcolor_water02".into(),
             material: Some("FX_E_T.WaterSurfaceShaderSet.ssq_water_01sh".into()),
             unreal_location: Vec3::new(137_023.0, 79_682.0, -3_736.0),
+            export: Some(529),
         });
         assert!(description.contains("Actor: StaticMeshActor529"));
         assert!(description.contains("Object: SSQ_dungeon_S.Broken_SSQ.fx_redcolor_water02"));

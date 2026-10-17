@@ -2106,6 +2106,8 @@ fn mesh_instance(export: &ExportDump) -> Option<MeshInstance> {
         .and_then(|value| triplet(&value.value))
         .unwrap_or(Vec3::ONE)
         * uniform_scale;
+    let col_location =
+        property(&export.properties, "ColLocation").and_then(|value| triplet(&value.value));
     Some(MeshInstance {
         name: export.name.clone(),
         mesh,
@@ -2113,6 +2115,12 @@ fn mesh_instance(export: &ExportDump) -> Option<MeshInstance> {
         rotation,
         scale: Vec3::new(scale.x, scale.z, scale.y),
         material_override: texture_modify_override(&export.properties),
+        source: Some(ActorSource {
+            export: export.index,
+            location,
+            rotation: rotation.as_ivec3(),
+            col_location,
+        }),
     })
 }
 

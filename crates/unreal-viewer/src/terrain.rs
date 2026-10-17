@@ -137,17 +137,19 @@ fn layer_texture_array(textures: &[&TextureGeometry]) -> Image {
             data.extend_from_slice(&level);
         }
     }
-    let mut image = Image::new(
+    // `Image::new` checks the data against the base level only, but the data
+    // carries every mip level.
+    let mut image = Image::new_uninit(
         Extent3d {
             width: size,
             height: size,
             depth_or_array_layers: textures.len().max(1) as u32,
         },
         TextureDimension::D2,
-        data,
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     );
+    image.data = Some(data);
     image.texture_descriptor.mip_level_count = mip_count;
     image.texture_view_descriptor = Some(TextureViewDescriptor {
         dimension: Some(TextureViewDimension::D2Array),

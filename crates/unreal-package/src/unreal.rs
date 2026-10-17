@@ -164,7 +164,6 @@ impl Package {
                 self.exports.len()
             ));
         }
-        let original = self.dump();
         let mut data = self.data.clone();
         let mut locations: Vec<(usize, usize)> = self
             .exports
@@ -175,12 +174,13 @@ impl Package {
 
         for (index, edited) in edited.iter().enumerate() {
             let Some(edited) = edited else { continue };
-            if semantic_export(edited)? == semantic_export(&original.exports[index])? {
+            let original = self.export_dump(index, &self.exports[index]);
+            if semantic_export(edited)? == semantic_export(&original)? {
                 continue;
             }
             changed = true;
             let offset = data.len();
-            let bytes = self.encode_export(edited, Some(&original.exports[index]), offset)?;
+            let bytes = self.encode_export(edited, Some(&original), offset)?;
             locations[index] = (offset, bytes.len());
             data.extend_from_slice(&bytes);
         }
@@ -204,6 +204,51 @@ impl Package {
         let export_offset = u32::try_from(export_offset).map_err(|_| "package exceeds u32")?;
         data[24..28].copy_from_slice(&export_offset.to_le_bytes());
         Ok(data)
+    }
+
+    /// Rebuilds the package with tagged property values replaced, adding a
+    /// property to its export when the export does not serialize it yet.
+    pub fn rebuild_with_property_edits(&self, edits: &[PropertyEdit]) -> Result<Vec<u8>, String> {
+        let mut edited: Vec<Option<ExportDump>> = (0..self.exports.len()).map(|_| None).collect();
+        for edit in edits {
+            let export = self
+                .exports
+                .get(edit.export)
+                .ok_or_else(|| format!("export {} does not exist", edit.export))?;
+            let dump = edited[edit.export].get_or_insert_with(|| self.export_dump(edit.export, export));
+            if dump.raw_data.is_some() {
+                return Err(format!(
+                    "export {} has undecoded properties and cannot be edited",
+                    edit.export
+                ));
+            }
+            match dump
+                .properties
+                .iter_mut()
+                .find(|property| property.array_index == 0 && property.name.eq_ignore_ascii_case(&edit.name))
+            {
+                Some(property) => property.value = edit.value.clone(),
+                None => {
+                    let added = PropertyDump {
+                        name: edit.name.clone(),
+                        property_type: edit.property_type.clone(),
+                        array_index: 0,
+                        size: 0,
+                        value: edit.value.clone(),
+                        raw: String::new(),
+                        wire_header: String::new(),
+                    };
+                    let (kind, structure) = property_kind(&added.property_type)?;
+                    let raw = self.encode_property_value(&added, kind, structure)?;
+                    dump.properties.push(PropertyDump {
+                        size: raw.len(),
+                        raw: hex(&raw),
+                        ..added
+                    });
+                }
+            }
+        }
+        self.rebuild_from_dumps(&edited)
     }
 
     fn encode_export(
@@ -253,7 +298,7 @@ impl Package {
         let raw = if original
             .is_some_and(|value| value.value != property.value && value.raw == property.raw)
         {
-            self.encode_property_value(property, kind)?
+            self.encode_property_value(property, kind, structure)?
         } else {
             decode_hex(&property.raw)?
         };
@@ -288,7 +333,12 @@ impl Package {
         Ok(())
     }
 
-    fn encode_property_value(&self, property: &PropertyDump, kind: u8) -> Result<Vec<u8>, String> {
+    fn encode_property_value(
+        &self,
+        property: &PropertyDump,
+        kind: u8,
+        structure: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
         match kind {
             1 => Ok(vec![
                 property.value.parse::<u8>().map_err(|e| e.to_string())?,
@@ -307,7 +357,7 @@ impl Package {
                 .to_vec()),
             5 => self.compact_bytes(self.object_wire(&property.value)?),
             6 => self.compact_bytes(self.name_index(&property.value)?),
-            10..=12 => encode_triplet(&property.value, kind != 12),
+            10..=12 => encode_triplet(&property.value, kind != 12 && structure != Some("Rotator")),
             13 => {
                 let mut value = property.value.as_bytes().to_vec();
                 value.push(0);
@@ -1049,6 +1099,16 @@ pub struct PropertyDump {
     pub wire_header: String,
 }
 
+/// A replacement value for one tagged property of an export.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropertyEdit {
+    pub export: usize,
+    pub name: String,
+    /// The dumped property type, such as `Vector`, `Rotator`, or `Float`.
+    pub property_type: String,
+    pub value: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectBundle {
@@ -1688,8 +1748,6 @@ fn property_kind(value: &str) -> Result<(u8, Option<&str>), String> {
         "Delegate" => (7, None),
         "Class" => (8, None),
         "Array" => (9, None),
-        "Vector" => (11, None),
-        "Rotator" => (12, None),
         "String" => (13, None),
         "Map" => (14, None),
         "FixedArray" => (15, None),
@@ -2101,6 +2159,8 @@ mod tests {
             "StaticMeshActor1",
             "Location",
             "Vector",
+            "Rotation",
+            "Rotator",
         ];
         let mut name_table = Vec::new();
         for name in names {
@@ -2191,6 +2251,34 @@ mod tests {
             reread.dump().exports[0].offset,
             package.dump().exports[0].offset
         );
+    }
+
+    #[test]
+    fn property_edits_replace_values_and_add_missing_struct_properties() {
+        let package =
+            Package::from_wire_bytes(Path::new("test.unr"), actor_test_package()).unwrap();
+        let edit = |name: &str, property_type: &str, value: &str| PropertyEdit {
+            export: 0,
+            name: name.into(),
+            property_type: property_type.into(),
+            value: value.into(),
+        };
+        let rebuilt = package
+            .rebuild_with_property_edits(&[
+                edit("Location", "Vector", "100,-200.5,300"),
+                edit("Rotation", "Rotator", "0,16384,-512"),
+            ])
+            .unwrap();
+
+        let reread = Package::from_wire_bytes(Path::new("test.unr"), rebuilt).unwrap();
+        let dump = reread.dump();
+        let properties = &dump.exports[0].properties;
+        assert_eq!(properties[0].value, "100,-200.5,300");
+        assert_eq!(properties[1].name, "Rotation");
+        assert_eq!(properties[1].property_type, "Rotator");
+        assert_eq!(properties[1].value, "0,16384,-512");
+        // A struct tag: kind 10 with a 12-byte size code, then the struct name.
+        assert_eq!(properties[1].wire_header, "093a0a");
     }
 
     #[test]

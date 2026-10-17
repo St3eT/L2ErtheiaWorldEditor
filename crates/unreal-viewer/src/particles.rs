@@ -173,6 +173,7 @@ pub(super) fn spawn_particle_systems(
                     -effect.location.z,
                     effect.location.y,
                 ),
+                export: None,
             },
             RayCastBackfaces,
         ));

@@ -302,6 +302,7 @@ fn setup(
                     .first()
                     .map(|layer| layer.texture.clone()),
                 unreal_location: Vec3::new(scene.origin.x, -scene.origin.z, scene.origin.y),
+                export: None,
             },
             RayCastBackfaces,
         ));
@@ -520,6 +521,12 @@ fn setup(
                         -instance.location.z,
                         instance.location.y,
                     ),
+                    // Skinned parts follow their skeleton, so only rigid
+                    // meshes are moved by the editor.
+                    export: instance
+                        .source
+                        .filter(|_| skinned_mesh.is_none())
+                        .map(|source| source.export),
                 },
                 RayCastBackfaces,
             ));
@@ -575,6 +582,7 @@ fn setup(
                     object: "Engine.Model".into(),
                     material: part.material.clone(),
                     unreal_location: Vec3::new(scene.origin.x, -scene.origin.z, scene.origin.y),
+                    export: None,
                 },
                 RayCastBackfaces,
             ));
@@ -881,7 +889,7 @@ fn setup(
         .map(|start| (start.location - scene.origin) / UNREAL_UNITS_PER_METER)
         .unwrap_or(overview_position);
     let camera_pitch = -camera_height.atan2(camera_distance);
-    let initial_move_speed = (scene.view_radius * 0.2).clamp(30.0, 240.0);
+    let initial_move_speed = DEFAULT_MOVE_SPEED;
     commands.insert_resource(SettingsMenuState {
         open: false,
         fog: scene.environment.fog.clone(),

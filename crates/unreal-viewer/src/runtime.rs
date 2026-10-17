@@ -437,6 +437,10 @@ fn fly_camera(input: FlyCameraInput, mut cameras: Query<(&mut Transform, &mut Fl
         transform.rotation = Quat::from_axis_angle(Vec3::Y, camera.yaw)
             * Quat::from_axis_angle(Vec3::X, camera.pitch);
         let mut movement = Vec3::ZERO;
+        // Control chords such as Ctrl+S belong to the map editor.
+        if input.keys.pressed(KeyCode::ControlLeft) || input.keys.pressed(KeyCode::ControlRight) {
+            continue;
+        }
         if input.keys.pressed(KeyCode::KeyW) {
             movement += *transform.forward();
         }
@@ -475,19 +479,22 @@ fn update_coordinate_readout(
     readout.0 = format!("X {:.0}  Y {:.0}  Z {:.0}", unreal.x, unreal.y, unreal.z);
 }
 
-fn select_rendered_object(
+pub(super) fn select_rendered_object(
     mut ray_cast: MeshRayCast,
     view: SelectionView,
     selectables: Query<&SelectableObject>,
     mut rendered_materials: Query<&mut MeshMaterial3d<StandardMaterial>>,
     mut state: ResMut<SelectionState>,
+    mut editor: ResMut<editor::MapEditor>,
     mut readout: Single<&mut Text, With<SelectionReadout>>,
 ) {
+    // Selecting on release lets a press on the selection start a drag instead.
     if view.teleport_menu.open
         || view.world_map.open
         || view.settings_menu.open
         || view.game_event_menu.open
-        || !view.buttons.just_pressed(MouseButton::Left)
+        || !view.buttons.just_released(MouseButton::Left)
+        || editor.is_dragging()
     {
         return;
     }
@@ -527,6 +534,7 @@ fn select_rendered_object(
     let Ok(selected) = selectables.get(entity) else {
         return;
     };
+    editor.selected = selected.export;
     readout.0 = format!(
         "Hit {} / {}\n{}",
         state.hit_index + 1,

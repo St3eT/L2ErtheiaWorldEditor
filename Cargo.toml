@@ -33,6 +33,10 @@ codegen-units = 256
 opt-level = 3
 debug = false
 
+# Decoding a map package dominates viewer start-up; unoptimized it is ~5x slower.
+[profile.dev.package.unreal-package]
+opt-level = 3
+
 [dependencies]
 clap = { version = "4.5.47", features = ["derive"] }
 quick-xml = { version = "0.41.0", features = ["serialize"] }
