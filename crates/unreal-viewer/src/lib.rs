@@ -621,6 +621,9 @@ struct ActorSource {
     location: Vec3,
     rotation: IVec3,
     col_location: Option<Vec3>,
+    /// Whether the actor is a plain static mesh actor, safe to clone into
+    /// new placements (movers carry keyframes and events).
+    static_mesh_actor: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -1053,6 +1056,7 @@ struct FlyCameraInput<'w> {
     world_map: Res<'w, WorldMapState>,
     settings_menu: Res<'w, SettingsMenuState>,
     game_event_menu: Res<'w, GameEventMenuState>,
+    editor: Res<'w, editor::MapEditor>,
 }
 
 #[derive(Component)]

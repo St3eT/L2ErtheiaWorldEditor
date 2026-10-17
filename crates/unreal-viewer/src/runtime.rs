@@ -439,8 +439,12 @@ fn fly_camera(input: FlyCameraInput, mut cameras: Query<(&mut Transform, &mut Fl
         transform.rotation = Quat::from_axis_angle(Vec3::Y, camera.yaw)
             * Quat::from_axis_angle(Vec3::X, camera.pitch);
         let mut movement = Vec3::ZERO;
-        // Control chords such as Ctrl+S belong to the map editor.
-        if input.keys.pressed(KeyCode::ControlLeft) || input.keys.pressed(KeyCode::ControlRight) {
+        // Control chords such as Ctrl+S belong to the map editor, and keys
+        // typed over the object browser go to its search.
+        if input.keys.pressed(KeyCode::ControlLeft)
+            || input.keys.pressed(KeyCode::ControlRight)
+            || input.editor.typing_in_browser()
+        {
             continue;
         }
         if input.keys.pressed(KeyCode::KeyW) {

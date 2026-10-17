@@ -2131,6 +2131,7 @@ fn mesh_instance(export: &ExportDump) -> Option<MeshInstance> {
             location,
             rotation: rotation.as_ivec3(),
             col_location,
+            static_mesh_actor: export.class.ends_with("StaticMeshActor"),
         }),
     })
 }

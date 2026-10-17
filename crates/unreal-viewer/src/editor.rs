@@ -3,6 +3,9 @@
 //! back into the map package.
 
 use bevy::camera::primitives::Aabb;
+use bevy::input::ButtonState;
+use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::mouse::MouseScrollUnit;
 use unreal_package::unreal::{ActorAddition, PropertyEdit, reencrypt_like};
 
 use super::*;
@@ -11,6 +14,11 @@ use super::*;
 const ROTATOR_UNITS: i32 = 65_536;
 /// Move steps offered by the panel, in Unreal units.
 const STEP_SIZES: [f32; 4] = [1.0, 16.0, 64.0, 256.0];
+/// Most catalog entries the browser lists at once; the search narrows them.
+const BROWSER_LIMIT: usize = 250;
+/// How far ahead of the camera an object lands when nothing is in view, in
+/// viewer metres.
+const PLACE_DISTANCE: f32 = 10.0;
 /// How far the cursor moves before a press on the selection becomes a drag.
 const DRAG_THRESHOLD: f32 = 4.0;
 
@@ -18,7 +26,15 @@ pub(super) struct MapEditorPlugin;
 
 impl Plugin for MapEditorPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, (spawn_editor_readout, spawn_editor_panel))
+        app.add_systems(
+            Startup,
+            (
+                spawn_editor_readout,
+                spawn_editor_panel,
+                spawn_toolbar,
+                spawn_object_browser,
+            ),
+        )
             .add_systems(
                 Update,
                 (
@@ -31,6 +47,11 @@ impl Plugin for MapEditorPlugin {
                     scroll_selected_height,
                     editor_shortcuts,
                     show_editor_panel.after(press_editor_buttons),
+                    type_in_browser,
+                    scroll_browser,
+                    refresh_object_browser
+                        .after(press_editor_buttons)
+                        .after(type_in_browser),
                     draw_selection_axes,
                     update_editor_readout,
                 ),
@@ -50,6 +71,33 @@ struct EditableActor {
     mesh: String,
     original: Placement,
     col_location: Option<Vec3>,
+}
+
+/// A mesh the object browser offers. It is placed by copying an actor that
+/// already shows it, so the copy has the mesh's materials and the map's
+/// level, zone and display settings.
+struct CatalogEntry {
+    mesh: String,
+    template: usize,
+    uses: usize,
+}
+
+fn catalog_from(instances: &[MeshInstance]) -> Vec<CatalogEntry> {
+    let mut catalog: BTreeMap<String, CatalogEntry> = BTreeMap::new();
+    for instance in instances {
+        let Some(source) = instance.source.filter(|source| source.static_mesh_actor) else {
+            continue;
+        };
+        catalog
+            .entry(instance.mesh.to_ascii_lowercase())
+            .or_insert_with(|| CatalogEntry {
+                mesh: instance.mesh.clone(),
+                template: source.export,
+                uses: 0,
+            })
+            .uses += 1;
+    }
+    catalog.into_values().collect()
 }
 
 /// An actor created in the viewer, written to the package on save.
@@ -97,6 +145,10 @@ pub(super) struct MapEditor {
     /// Move step of the panel buttons, in Unreal units.
     step: f32,
     pointer_over_panel: bool,
+    pointer_over_browser: bool,
+    catalog: Vec<CatalogEntry>,
+    browser_open: bool,
+    search: String,
     status: String,
 }
 
@@ -137,8 +189,35 @@ impl MapEditor {
             drag: None,
             step: STEP_SIZES[1],
             pointer_over_panel: false,
+            pointer_over_browser: false,
+            catalog: catalog_from(instances),
+            browser_open: false,
+            search: String::new(),
             status: String::new(),
         }
+    }
+
+    /// Whether keys go to the object browser's search rather than the camera.
+    pub(super) fn typing_in_browser(&self) -> bool {
+        self.browser_open && self.pointer_over_browser
+    }
+
+    /// Catalog entries whose mesh name contains every word of the search.
+    fn matching_catalog(&self) -> Vec<usize> {
+        let terms: Vec<String> = self
+            .search
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect();
+        self.catalog
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                let mesh = entry.mesh.to_ascii_lowercase();
+                terms.iter().all(|term| mesh.contains(term))
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// Whether a click belongs to the editor panel rather than the scene.
@@ -187,10 +266,16 @@ impl MapEditor {
     /// Records a copy of `template` at `placement` and returns the export
     /// index it will be saved as.
     fn add_copy(&mut self, template: usize, placement: Placement) -> Option<usize> {
+        let name = format!("Copy of {}", self.actors.get(&template)?.name);
+        self.add_placed(template, placement, name)
+    }
+
+    /// Records a new actor cloned from `template`, shown as `name` until saved.
+    fn add_placed(&mut self, template: usize, placement: Placement, name: String) -> Option<usize> {
         let source = self.actors.get(&template)?;
         let export = self.base_exports + self.additions.len();
         let actor = EditableActor {
-            name: format!("Copy of {}", source.name),
+            name,
             mesh: source.mesh.clone(),
             original: placement,
             col_location: None,
@@ -575,6 +660,25 @@ fn copy_selection(
     let Some(export) = editor.add_copy(template, placement) else {
         return;
     };
+    spawn_copy(commands, editor, parts, highlight, scene_origin, template, export);
+    let name = &editor.actors[&export].name;
+    editor.status = format!("Copied; {name} is selected (saved with the map)");
+}
+
+/// Spawns the surfaces of `template` for the added actor `export` at its
+/// placement and selects it.
+fn spawn_copy(
+    commands: &mut Commands,
+    editor: &mut MapEditor,
+    parts: &Query<(Entity, &mut Transform, &mut SelectableObject)>,
+    highlight: &SelectionState,
+    scene_origin: Vec3,
+    template: usize,
+    export: usize,
+) {
+    let Some(placement) = editor.placement(export) else {
+        return;
+    };
     let name = editor.actors[&export].name.clone();
     let translation = viewer_translation(placement.location, scene_origin);
     let rotation = viewer_rotation(placement.rotation);
@@ -609,7 +713,29 @@ fn copy_selection(
         }
     }
     editor.selected = Some(export);
-    editor.status = format!("Copied; {name} is selected (saved with the map)");
+}
+
+/// Where the centre of the view meets the scene, in Unreal coordinates, or a
+/// point ahead of the camera when it looks at nothing.
+fn placement_point(
+    ray_cast: &mut MeshRayCast,
+    parts: &Query<(Entity, &mut Transform, &mut SelectableObject)>,
+    camera: &GlobalTransform,
+    scene_origin: Vec3,
+) -> Vec3 {
+    let ray = Ray3d::new(camera.translation(), camera.forward());
+    let surface = |entity| {
+        parts
+            .get(entity)
+            .is_ok_and(|(_, _, object)| object.object != "Engine.Emitter")
+    };
+    let settings = MeshRayCastSettings::default().with_filter(&surface);
+    let point = ray_cast
+        .cast_ray(ray, &settings)
+        .first()
+        .map(|(_, hit)| hit.point)
+        .unwrap_or_else(|| ray.get_point(PLACE_DISTANCE));
+    camera_unreal_coordinates(point, scene_origin).round()
 }
 
 fn save(editor: &mut MapEditor) {
@@ -740,6 +866,8 @@ enum EditorAction {
     Step(f32),
     DropToFloor,
     Copy,
+    ToggleBrowser,
+    Place(usize),
     Undo,
     Save,
     Close,
@@ -773,6 +901,7 @@ fn spawn_editor_panel(mut commands: Commands) {
             BackgroundColor(Color::srgba(0.015, 0.02, 0.03, 0.92)),
             Interaction::default(),
             Visibility::Hidden,
+            EditorUi,
             EditorPanel,
         ))
         .id();
@@ -894,18 +1023,229 @@ fn panel_row<const N: usize>(
 /// Whether the pointer is over the panel, so clicks on it do not reach the
 /// scene behind.
 fn track_panel_pointer(
-    panel: Single<(&Interaction, &Visibility), With<EditorPanel>>,
-    buttons: Query<&Interaction, With<EditorAction>>,
+    roots: Query<(&Interaction, &Visibility, Has<ObjectBrowser>), With<EditorUi>>,
+    buttons: Query<(&Interaction, Has<BrowserItem>), With<EditorAction>>,
     mut editor: ResMut<MapEditor>,
 ) {
-    let (interaction, visibility) = *panel;
-    // A hovered button takes the pointer from the panel behind it.
-    let over = *visibility != Visibility::Hidden
-        && (*interaction != Interaction::None
-            || buttons.iter().any(|button| *button != Interaction::None));
+    // A hovered button takes the pointer from the panel behind it; buttons in
+    // hidden panels never hover.
+    let hovered = |interaction: &Interaction| *interaction != Interaction::None;
+    let mut over = false;
+    let mut over_browser = false;
+    for (interaction, visibility, browser) in &roots {
+        if *visibility != Visibility::Hidden && hovered(interaction) {
+            over = true;
+            over_browser |= browser;
+        }
+    }
+    for (interaction, in_browser) in &buttons {
+        if hovered(interaction) {
+            over = true;
+            over_browser |= in_browser;
+        }
+    }
     if editor.pointer_over_panel != over {
         editor.pointer_over_panel = over;
     }
+    if editor.pointer_over_browser != over_browser {
+        editor.pointer_over_browser = over_browser;
+    }
+}
+
+/// Every top-level editor UI node; the pointer over one belongs to the UI.
+#[derive(Component)]
+struct EditorUi;
+
+#[derive(Component)]
+struct ObjectBrowser;
+
+#[derive(Component)]
+struct BrowserTitle;
+
+#[derive(Component)]
+struct BrowserList;
+
+/// A button inside the object browser.
+#[derive(Component)]
+struct BrowserItem;
+
+fn spawn_toolbar(mut commands: Commands) {
+    let toolbar = commands
+        .spawn((
+            Name::new("Map editor toolbar"),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(370),
+                top: px(12),
+                width: px(330),
+                padding: UiRect::all(px(6)),
+                border_radius: BorderRadius::all(px(6)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.015, 0.02, 0.03, 0.92)),
+            Interaction::default(),
+            EditorUi,
+        ))
+        .id();
+    commands.entity(toolbar).with_children(|parent| {
+        panel_row(
+            parent,
+            [
+                ("Objects".to_string(), EditorAction::ToggleBrowser),
+                ("Undo".to_string(), EditorAction::Undo),
+                ("Save".to_string(), EditorAction::Save),
+            ],
+        );
+    });
+}
+
+fn spawn_object_browser(mut commands: Commands) {
+    let browser = commands
+        .spawn((
+            Name::new("Object browser"),
+            Node {
+                position_type: PositionType::Absolute,
+                right: px(12),
+                top: px(110),
+                bottom: px(12),
+                width: px(460),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(px(12)),
+                row_gap: px(6),
+                border_radius: BorderRadius::all(px(6)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.015, 0.02, 0.03, 0.94)),
+            Interaction::default(),
+            Visibility::Hidden,
+            EditorUi,
+            ObjectBrowser,
+        ))
+        .id();
+    commands.entity(browser).with_children(|parent| {
+        parent.spawn((
+            Text::new(""),
+            TextFont {
+                font_size: FontSize::Px(15.0),
+                ..default()
+            },
+            TextColor(Color::WHITE),
+            BrowserTitle,
+        ));
+        parent.spawn((
+            Node {
+                width: percent(100),
+                flex_grow: 1.0,
+                flex_direction: FlexDirection::Column,
+                overflow: Overflow::scroll_y(),
+                scrollbar_width: 12.0,
+                row_gap: px(3),
+                ..default()
+            },
+            ScrollPosition::default(),
+            BrowserList,
+        ));
+        panel_row(parent, [("Close".to_string(), EditorAction::ToggleBrowser)]);
+    });
+}
+
+/// Keys typed while the pointer is over the browser edit its search.
+fn type_in_browser(mut keys: MessageReader<KeyboardInput>, mut editor: ResMut<MapEditor>) {
+    let typing = editor.typing_in_browser();
+    for key in keys.read() {
+        if !typing || key.state != ButtonState::Pressed {
+            continue;
+        }
+        match &key.logical_key {
+            Key::Character(text) => {
+                let text: String = text.chars().filter(|character| !character.is_control()).collect();
+                editor.search.push_str(&text);
+            }
+            Key::Space => editor.search.push(' '),
+            Key::Backspace => {
+                editor.search.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scroll_browser(
+    scroll: Res<AccumulatedMouseScroll>,
+    editor: Res<MapEditor>,
+    mut list: Single<&mut ScrollPosition, With<BrowserList>>,
+) {
+    if !editor.browser_open || !editor.pointer_over_browser || scroll.delta.y == 0.0 {
+        return;
+    }
+    let lines = match scroll.unit {
+        MouseScrollUnit::Line => scroll.delta.y,
+        MouseScrollUnit::Pixel => scroll.delta.y / PIXELS_PER_NOTCH,
+    };
+    list.y = (list.y - lines * 40.0).max(0.0);
+}
+
+/// Shows the browser while it is open and lists the catalog entries that
+/// match the search whenever the search changes.
+fn refresh_object_browser(
+    mut commands: Commands,
+    view: SelectionView,
+    editor: Res<MapEditor>,
+    mut browser: Single<&mut Visibility, With<ObjectBrowser>>,
+    mut title: Single<&mut Text, With<BrowserTitle>>,
+    list: Single<(Entity, &mut ScrollPosition), With<BrowserList>>,
+    mut listed: Local<Option<String>>,
+) {
+    let wanted = if editor.browser_open && !menus_open(&view) {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    if **browser != wanted {
+        **browser = wanted;
+    }
+    if !editor.browser_open || listed.as_deref() == Some(editor.search.as_str()) {
+        return;
+    }
+    *listed = Some(editor.search.clone());
+    let matches = editor.matching_catalog();
+    title.0 = format!(
+        "Objects in this map: {} meshes, {} shown\nSearch: {}_\nHover the list and type to search (Backspace erases).\nClick an object to place it where the view is centred.",
+        editor.catalog.len(),
+        matches.len().min(BROWSER_LIMIT),
+        editor.search,
+    );
+    let (list, mut scroll) = list.into_inner();
+    scroll.y = 0.0;
+    commands.entity(list).despawn_related::<Children>();
+    commands.entity(list).with_children(|list| {
+        for index in matches.into_iter().take(BROWSER_LIMIT) {
+            let entry = &editor.catalog[index];
+            list.spawn((
+                Button,
+                Node {
+                    width: percent(100),
+                    min_height: px(28),
+                    padding: UiRect::axes(px(8), px(4)),
+                    border_radius: BorderRadius::all(px(3)),
+                    ..default()
+                },
+                BackgroundColor(BUTTON_COLOR),
+                EditorAction::Place(index),
+                BrowserItem,
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    Text::new(format!("{}  ({}x)", entry.mesh, entry.uses)),
+                    TextFont {
+                        font_size: FontSize::Px(14.0),
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+            });
+        }
+    });
 }
 
 fn show_editor_panel(
@@ -974,6 +1314,32 @@ fn press_editor_buttons(
             EditorAction::Undo => undo(&mut commands, &mut editor, &mut parts, scene.origin),
             EditorAction::Save => save(&mut editor),
             EditorAction::Close => editor.selected = None,
+            EditorAction::ToggleBrowser => editor.browser_open = !editor.browser_open,
+            EditorAction::Place(index) => {
+                let Some(entry) = editor.catalog.get(index) else {
+                    continue;
+                };
+                let (template, mesh) = (entry.template, entry.mesh.clone());
+                let placement = Placement {
+                    location: placement_point(&mut ray_cast, &parts, &camera, scene.origin),
+                    rotation: IVec3::ZERO,
+                };
+                let short = mesh.rsplit('.').next().unwrap_or(&mesh).to_string();
+                let Some(export) = editor.add_placed(template, placement, format!("New {short}"))
+                else {
+                    continue;
+                };
+                spawn_copy(
+                    &mut commands,
+                    &mut editor,
+                    &parts,
+                    &highlight,
+                    scene.origin,
+                    template,
+                    export,
+                );
+                editor.status = format!("Placed {mesh}; it is selected (saved with the map)");
+            }
             EditorAction::Copy => {
                 // Beside the original, a few steps to the camera's right.
                 let offset =
@@ -1096,6 +1462,7 @@ mod tests {
                 location: Vec3::new(100.0, 200.0, 300.0),
                 rotation: IVec3::new(0, 16384, 0),
                 col_location: Some(Vec3::new(100.0, 200.0, 340.0)),
+                static_mesh_actor: true,
             }),
         };
         MapEditor::new(Path::new("map.unr"), Vec::new(), &[instance])
@@ -1369,6 +1736,46 @@ mod tests {
         );
         assert_eq!(location(gate.export), Some(gate.location));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_catalog_lists_each_static_mesh_once_and_searches_by_words() {
+        let instance = |name: &str, mesh: &str, export, static_mesh_actor| MeshInstance {
+            name: name.into(),
+            mesh: mesh.into(),
+            location: Vec3::ZERO,
+            rotation: Vec3::ZERO,
+            scale: Vec3::ONE,
+            material_override: MaterialOverride::default(),
+            source: Some(ActorSource {
+                export,
+                location: Vec3::ZERO,
+                rotation: IVec3::ZERO,
+                col_location: None,
+                static_mesh_actor,
+            }),
+        };
+        let mut editor = MapEditor::new(
+            Path::new("map.unr"),
+            Vec::new(),
+            &[
+                instance("A", "Aden_Village_S.Aden_Platform01", 3, true),
+                instance("B", "aden_village_s.aden_platform01", 4, true),
+                instance("C", "Aden_Castle_S.Aden_castle_Maingate", 5, true),
+                instance("D", "Aden_Castle_S.Door_Mover", 6, false),
+            ],
+        );
+        assert_eq!(editor.catalog.len(), 2);
+        assert_eq!(editor.catalog[1].mesh, "Aden_Village_S.Aden_Platform01");
+        assert_eq!(editor.catalog[1].template, 3);
+        assert_eq!(editor.catalog[1].uses, 2);
+
+        editor.search = "aden  PLATFORM".into();
+        assert_eq!(editor.matching_catalog(), [1]);
+        editor.search = "castle gate".into();
+        assert_eq!(editor.matching_catalog(), [0]);
+        editor.search.clear();
+        assert_eq!(editor.matching_catalog(), [0, 1]);
     }
 
     #[test]
