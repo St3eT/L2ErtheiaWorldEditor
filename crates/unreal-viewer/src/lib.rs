@@ -761,13 +761,17 @@ struct TimeOfDay {
     hour: f32,
     /// Real seconds a whole day lasts.
     day_length: f32,
+    /// Whether the clock advances. Lineage maps are lit as authored, so the
+    /// viewer holds noon, when the sun shines from the map's own sun.
+    running: bool,
 }
 
 impl Default for TimeOfDay {
     fn default() -> Self {
         Self {
-            hour: 10.0,
+            hour: 12.0,
             day_length: 300.0,
+            running: false,
         }
     }
 }
@@ -2108,8 +2112,11 @@ mod tests {
     #[test]
     fn a_day_wraps_and_its_length_steps_through_the_settings() {
         let mut clock = TimeOfDay::default();
+        // The viewer holds the map's own noon unless asked to run the clock.
+        assert!(!clock.running);
+        assert_eq!(clock.hour, 12.0);
         clock.advance(clock.day_length * 0.75);
-        assert!((clock.hour - 4.0).abs() < 1.0e-3);
+        assert!((clock.hour - 6.0).abs() < 1.0e-3);
 
         clock.change_day_length(true);
         assert_eq!(clock.day_length, 600.0);

@@ -682,10 +682,14 @@ fn panel_row<const N: usize>(
 /// scene behind.
 fn track_panel_pointer(
     panel: Single<(&Interaction, &Visibility), With<EditorPanel>>,
+    buttons: Query<&Interaction, With<EditorAction>>,
     mut editor: ResMut<MapEditor>,
 ) {
     let (interaction, visibility) = *panel;
-    let over = *visibility != Visibility::Hidden && *interaction != Interaction::None;
+    // A hovered button takes the pointer from the panel behind it.
+    let over = *visibility != Visibility::Hidden
+        && (*interaction != Interaction::None
+            || buttons.iter().any(|button| *button != Interaction::None));
     if editor.pointer_over_panel != over {
         editor.pointer_over_panel = over;
     }

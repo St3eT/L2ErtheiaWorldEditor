@@ -33,7 +33,9 @@ impl Plugin for ViewerRuntimePlugin {
 }
 
 fn advance_time_of_day(time: Res<Time>, mut clock: ResMut<TimeOfDay>) {
-    clock.advance(time.delta_secs());
+    if clock.running {
+        clock.advance(time.delta_secs());
+    }
 }
 
 // Lineage swings the sun across its sky room on its own clock, keeps the moon
