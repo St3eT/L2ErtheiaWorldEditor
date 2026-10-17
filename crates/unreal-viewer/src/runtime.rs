@@ -495,6 +495,7 @@ pub(super) fn select_rendered_object(
         || view.game_event_menu.open
         || !view.buttons.just_released(MouseButton::Left)
         || editor.is_dragging()
+        || editor.pointer_over_panel()
     {
         return;
     }
