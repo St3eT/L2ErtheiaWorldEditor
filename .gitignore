@@ -1,0 +1,8 @@
+target/
+testdata/
+.idea/
+/*.unr
+/*.json
+/*.xml
+/*.tar.gz
+dist/

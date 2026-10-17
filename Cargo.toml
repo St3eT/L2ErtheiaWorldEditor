@@ -1,0 +1,45 @@
+[package]
+name = "unreal-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Extract and rebuild Unreal Engine 2 .unr and .ukx packages"
+license = "MIT"
+repository = "https://github.com/UnAfraid/unreal-rs"
+readme = "README-RUST.md"
+
+[workspace]
+members = ["crates/unreal-package", "crates/unreal-viewer"]
+default-members = [".", "crates/unreal-package"]
+resolver = "3"
+
+[[bin]]
+name = "unreal-rs"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+codegen-units = 256
+
+# Dependencies (notably Bevy) are compiled optimized once and cached, so dev
+# builds of the viewer run smoothly while workspace crates rebuild quickly.
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[dependencies]
+clap = { version = "4.5.47", features = ["derive"] }
+quick-xml = { version = "0.41.0", features = ["serialize"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+unreal-package = { path = "crates/unreal-package" }
+unreal-viewer = { path = "crates/unreal-viewer", optional = true }
+
+[features]
+viewer = ["dep:unreal-viewer"]

@@ -1,0 +1,12 @@
+[package]
+name = "unreal-viewer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+bcdec_rs = "0.2.0"
+bevy = { version = "0.19.1", default-features = false, features = ["default_app", "3d_bevy_render", "bevy_text", "bevy_ui", "bevy_ui_render", "bevy_winit", "default_font", "mesh_picking", "multi_threaded", "pbr_clustered_decals", "x11", "wayland"] }
+serde_json = "1.0.151"
+unreal-package = { path = "../unreal-package" }
