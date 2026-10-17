@@ -2088,6 +2088,111 @@ mod tests {
         assert_eq!(names[imports[2].class_name.index.get()].value, "Sound");
     }
 
+    /// A minimal map-like package with one `Engine.StaticMeshActor` export
+    /// whose only tagged property is `Location`.
+    fn actor_test_package() -> Vec<u8> {
+        let names = [
+            "None",
+            "Core",
+            "Package",
+            "Class",
+            "Engine",
+            "StaticMeshActor",
+            "StaticMeshActor1",
+            "Location",
+            "Vector",
+        ];
+        let mut name_table = Vec::new();
+        for name in names {
+            write_unreal_string(&mut name_table, name).unwrap();
+            name_table.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let mut import_table = BinaryWriter::default();
+        for (class_name, outer, name) in [(2, 0, 4), (3, -1, 5)] {
+            import_table.compact(1);
+            import_table.compact(class_name);
+            import_table.i32(outer);
+            import_table.compact(name);
+        }
+        let mut object = BinaryWriter::default();
+        object.compact(7);
+        object.u8(0x3a);
+        object.compact(8);
+        for axis in [147456.0f32, 5391.995, 5776.0] {
+            object.bytes(&axis.to_le_bytes());
+        }
+        object.compact(0);
+        let (import_table, object) = (import_table.into_bytes(), object.into_bytes());
+
+        let name_offset = 64;
+        let import_offset = name_offset + name_table.len();
+        let object_offset = import_offset + import_table.len();
+        let export_offset = object_offset + object.len();
+        let mut export_table = BinaryWriter::default();
+        export_table.compact(-2);
+        export_table.compact(0);
+        export_table.i32(0);
+        export_table.compact(6);
+        export_table.u32(0);
+        export_table.compact(object.len() as i32);
+        export_table.compact(object_offset as i32);
+
+        let mut data = MAGIC.to_le_bytes().to_vec();
+        data.extend_from_slice(&123u16.to_le_bytes());
+        data.extend_from_slice(&37u16.to_le_bytes());
+        for value in [
+            0,
+            names.len(),
+            name_offset,
+            1,
+            export_offset,
+            2,
+            import_offset,
+        ] {
+            data.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        data.resize(name_offset, 0);
+        data.extend_from_slice(&name_table);
+        data.extend_from_slice(&import_table);
+        data.extend_from_slice(&object);
+        data.extend_from_slice(&export_table.into_bytes());
+        data
+    }
+
+    fn location(package: &Package) -> String {
+        let dump = package.dump();
+        let property = &dump.exports[0].properties[0];
+        assert_eq!(property.name, "Location");
+        property.value.clone()
+    }
+
+    #[test]
+    fn unchanged_actor_package_rebuilds_byte_for_byte() {
+        let bytes = actor_test_package();
+        let package = Package::from_wire_bytes(Path::new("test.unr"), bytes.clone()).unwrap();
+        assert_eq!(package.dump().exports[0].class, "Engine.StaticMeshActor");
+        assert_eq!(location(&package), "147456,5391.995,5776");
+
+        let exports: Vec<_> = package.dump().exports.into_iter().map(Some).collect();
+        assert_eq!(package.rebuild_from_dumps(&exports).unwrap(), bytes);
+    }
+
+    #[test]
+    fn edited_actor_location_is_written_and_decodes_again() {
+        let package =
+            Package::from_wire_bytes(Path::new("test.unr"), actor_test_package()).unwrap();
+        let mut exports: Vec<_> = package.dump().exports.into_iter().map(Some).collect();
+        exports[0].as_mut().unwrap().properties[0].value = "147456,5391.995,7776".into();
+
+        let rebuilt = package.rebuild_from_dumps(&exports).unwrap();
+        let reread = Package::from_wire_bytes(Path::new("test.unr"), rebuilt).unwrap();
+        assert_eq!(location(&reread), "147456,5391.995,7776");
+        assert_ne!(
+            reread.dump().exports[0].offset,
+            package.dump().exports[0].offset
+        );
+    }
+
     #[test]
     fn unreal_string_writer_round_trips_ascii_and_unicode() {
         for value in ["Grim_reaper", "Звук"] {

@@ -13,6 +13,8 @@ automatically. The tool does not need Java or `L2.ini`.
 cargo build --release
 target/release/unreal-rs unr export --input /path/to/map.unr --output map.xml
 target/release/unreal-rs unr export --input /path/to/LineageII/MAPS --output all-maps.json
+target/release/unreal-rs unr export --input /path/to/map.unr --output decoded-map --format json
+target/release/unreal-rs unr import --input decoded-map --output rebuilt.unr
 target/release/unreal-rs ukx export --input /path/to/animations.ukx --output animations.xml
 target/release/unreal-rs ukx export --input /path/to/LineageII/ANIMATIONS --output all-animations.json
 target/release/unreal-rs ukx import --input /path/to/decoded-folder --output rebuilt.ukx
@@ -92,11 +94,14 @@ GUID and generations, string and compact-integer encodings, table layout,
 padding, and original native payloads. A package importer can therefore reuse
 unchanged spans exactly and rebuild only values edited in the readable export.
 
-`ukx import` accepts a JSON directory export containing this wire source. An
+`unr import` and `ukx import` accept a JSON directory export containing this
+wire source. An
 unchanged export reproduces the input byte-for-byte. Edited tagged properties,
 `Engine.MeshAnimation`, and `Engine.SkeletalMesh` objects are encoded into new
 export payloads, with export-table and absolute lazy-array offsets recalculated.
-Property `value` edits support scalar numbers, object/name references, vectors,
+For maps this covers actor properties such as `Location`, `Rotation`, and
+`ColLocation`; native map objects (level, BSP model, terrain) can be preserved
+but not yet re-encoded after edits. Property `value` edits support scalar numbers, object/name references, vectors,
 rotators, and strings; `raw` remains available for other property encodings.
 Names and object paths used by edits must already exist in the package tables.
 
