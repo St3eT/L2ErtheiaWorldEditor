@@ -3,7 +3,7 @@
 //! back into the map package.
 
 use bevy::camera::primitives::Aabb;
-use unreal_package::unreal::{PropertyEdit, reencrypt_like};
+use unreal_package::unreal::{ActorAddition, PropertyEdit, reencrypt_like};
 
 use super::*;
 
@@ -52,6 +52,21 @@ struct EditableActor {
     col_location: Option<Vec3>,
 }
 
+/// An actor created in the viewer, written to the package on save.
+#[derive(Clone, Debug, PartialEq)]
+struct Addition {
+    /// The export index the actor will have once added.
+    export: usize,
+    /// The actor it was copied from.
+    template: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum UndoStep {
+    Moved(usize, Placement),
+    Added(usize),
+}
+
 struct Drag {
     export: usize,
     start_cursor: Vec2,
@@ -72,7 +87,11 @@ pub(super) struct MapEditor {
     actors: HashMap<usize, EditableActor>,
     edits: BTreeMap<usize, Placement>,
     saved: BTreeMap<usize, Placement>,
-    undo: Vec<(usize, Placement)>,
+    /// Exports the loaded package has; added actors are numbered after them.
+    base_exports: usize,
+    additions: Vec<Addition>,
+    saved_additions: Vec<Addition>,
+    undo: Vec<UndoStep>,
     pub(super) selected: Option<usize>,
     drag: Option<Drag>,
     /// Move step of the panel buttons, in Unreal units.
@@ -83,7 +102,7 @@ pub(super) struct MapEditor {
 
 impl MapEditor {
     pub(super) fn new(path: &Path, wire: Vec<u8>, instances: &[MeshInstance]) -> Self {
-        let actors = instances
+        let actors: HashMap<usize, EditableActor> = instances
             .iter()
             .filter_map(|instance| {
                 let source = instance.source?;
@@ -101,12 +120,18 @@ impl MapEditor {
                 ))
             })
             .collect();
+        let base_exports = Package::from_wire_bytes(path, wire.clone())
+            .map(|package| package.export_count())
+            .unwrap_or_else(|_| actors.keys().max().map_or(0, |export| export + 1));
         Self {
             path: path.to_path_buf(),
             wire,
             actors,
             edits: BTreeMap::new(),
             saved: BTreeMap::new(),
+            base_exports,
+            additions: Vec::new(),
+            saved_additions: Vec::new(),
             undo: Vec::new(),
             selected: None,
             drag: None,
@@ -146,15 +171,52 @@ impl MapEditor {
 
     fn unsaved_changes(&self) -> usize {
         let exports: BTreeSet<_> = self.edits.keys().chain(self.saved.keys()).collect();
-        exports
+        let moved = exports
             .into_iter()
             .filter(|export| self.edits.get(export) != self.saved.get(export))
-            .count()
+            .count();
+        let unchanged_additions = self
+            .additions
+            .iter()
+            .zip(&self.saved_additions)
+            .take_while(|(addition, saved)| addition == saved)
+            .count();
+        moved + self.additions.len() + self.saved_additions.len() - 2 * unchanged_additions
+    }
+
+    /// Records a copy of `template` at `placement` and returns the export
+    /// index it will be saved as.
+    fn add_copy(&mut self, template: usize, placement: Placement) -> Option<usize> {
+        let source = self.actors.get(&template)?;
+        let export = self.base_exports + self.additions.len();
+        let actor = EditableActor {
+            name: format!("Copy of {}", source.name),
+            mesh: source.mesh.clone(),
+            original: placement,
+            col_location: None,
+        };
+        self.actors.insert(export, actor);
+        self.additions.push(Addition { export, template });
+        self.undo.push(UndoStep::Added(export));
+        Some(export)
+    }
+
+    /// Forgets the most recent copy, which undo always reaches last-in first.
+    fn remove_addition(&mut self, export: usize) {
+        if self.additions.last().is_some_and(|addition| addition.export == export) {
+            self.additions.pop();
+            self.actors.remove(&export);
+            self.edits.remove(&export);
+            if self.selected == Some(export) {
+                self.selected = None;
+            }
+        }
     }
 
     fn property_edits(&self) -> Vec<PropertyEdit> {
         let mut edits = Vec::new();
-        for (&export, placement) in &self.edits {
+        // Added actors are written whole with their current placement.
+        for (&export, placement) in self.edits.range(..self.base_exports) {
             let actor = &self.actors[&export];
             let mut edit = |name: &str, property_type: &str, value: String| {
                 edits.push(PropertyEdit {
@@ -188,7 +250,26 @@ impl MapEditor {
     /// Writes the edited map over the loaded file, keeping the first version
     /// that was ever overwritten next to it as `<map>.bak`.
     fn save(&mut self) -> Result<PathBuf, String> {
-        let package = Package::from_wire_bytes(&self.path, self.wire.clone())?;
+        let mut package = Package::from_wire_bytes(&self.path, self.wire.clone())?;
+        for addition in &self.additions {
+            let placement = self
+                .placement(addition.export)
+                .ok_or("an added actor has no placement")?;
+            let rotation = placement.rotation;
+            let (bytes, export) = package.add_actor(&ActorAddition {
+                template: addition.template,
+                static_mesh: None,
+                location: vector_value(placement.location),
+                rotation: format!("{},{},{}", rotation.x, rotation.y, rotation.z),
+            })?;
+            if export != addition.export {
+                return Err(format!(
+                    "added actor became export {export}, expected {}",
+                    addition.export
+                ));
+            }
+            package = Package::from_wire_bytes(&self.path, bytes)?;
+        }
         let plain = package.rebuild_with_property_edits(&self.property_edits())?;
         let filename = self
             .path
@@ -207,6 +288,7 @@ impl MapEditor {
         fs::rename(&temporary, &self.path)
             .map_err(|error| format!("cannot replace {}: {error}", self.path.display()))?;
         self.saved = self.edits.clone();
+        self.saved_additions = self.additions.clone();
         Ok(backup)
     }
 }
@@ -362,7 +444,7 @@ fn finish_drag(buttons: Res<ButtonInput<MouseButton>>, mut editor: ResMut<MapEdi
         return;
     }
     if let Some(drag) = editor.drag.take().filter(|drag| drag.active) {
-        editor.undo.push((drag.export, drag.start));
+        editor.undo.push(UndoStep::Moved(drag.export, drag.start));
     }
 }
 
@@ -418,7 +500,7 @@ fn scroll_selected_height(
     let mut placement = before;
     placement.location.z += whole * editor.step;
     if gesture.export != Some(export) || !continuing {
-        editor.undo.push((export, before));
+        editor.undo.push(UndoStep::Moved(export, before));
     }
     gesture.export = Some(export);
     editor.set_placement(export, placement);
@@ -427,6 +509,7 @@ fn scroll_selected_height(
 
 /// Keyboard chords kept alongside the panel buttons.
 fn editor_shortcuts(
+    mut commands: Commands,
     view: SelectionView,
     scene: Res<MapScene>,
     mut editor: ResMut<MapEditor>,
@@ -440,7 +523,7 @@ fn editor_shortcuts(
         return;
     }
     if keys.just_pressed(KeyCode::KeyZ) {
-        undo(&mut editor, &mut parts, scene.origin);
+        undo(&mut commands, &mut editor, &mut parts, scene.origin);
     }
     if keys.just_pressed(KeyCode::KeyS) {
         save(&mut editor);
@@ -448,19 +531,85 @@ fn editor_shortcuts(
 }
 
 fn undo(
+    commands: &mut Commands,
     editor: &mut MapEditor,
     parts: &mut Query<(Entity, &mut Transform, &mut SelectableObject)>,
     scene_origin: Vec3,
 ) {
     match editor.undo.pop() {
-        Some((export, placement)) => {
+        Some(UndoStep::Moved(export, placement)) => {
             editor.set_placement(export, placement);
             apply_placement(parts, scene_origin, export, placement);
             editor.selected = Some(export);
             editor.status = "Undone".into();
         }
+        Some(UndoStep::Added(export)) => {
+            for (entity, _, object) in parts.iter() {
+                if object.export == Some(export) {
+                    commands.entity(entity).despawn();
+                }
+            }
+            editor.remove_addition(export);
+            editor.status = "Removed the copy".into();
+        }
         None => editor.status = "Nothing to undo".into(),
     }
+}
+
+/// Spawns a copy of the selected actor's surfaces beside it and selects it.
+fn copy_selection(
+    commands: &mut Commands,
+    editor: &mut MapEditor,
+    parts: &Query<(Entity, &mut Transform, &mut SelectableObject)>,
+    highlight: &SelectionState,
+    scene_origin: Vec3,
+    offset: Vec3,
+) {
+    let Some(template) = editor.selected else {
+        return;
+    };
+    let Some(mut placement) = editor.placement(template) else {
+        return;
+    };
+    placement.location += offset;
+    let Some(export) = editor.add_copy(template, placement) else {
+        return;
+    };
+    let name = editor.actors[&export].name.clone();
+    let translation = viewer_translation(placement.location, scene_origin);
+    let rotation = viewer_rotation(placement.rotation);
+    for (entity, transform, object) in parts.iter() {
+        if object.export != Some(template) {
+            continue;
+        }
+        let mut source = commands.entity(entity);
+        let mut copy = source.clone_and_spawn_with_opt_out(|builder| {
+            builder.deny::<SelectableObject>().linked_cloning(true);
+        });
+        copy.insert((
+            Transform {
+                translation,
+                rotation,
+                scale: transform.scale,
+            },
+            SelectableObject {
+                actor: name.clone(),
+                object: object.object.clone(),
+                material: object.material.clone(),
+                unreal_location: placement.location,
+                export: Some(export),
+            },
+        ));
+        // The selected surface wears the highlight; its copy gets the real
+        // material back.
+        if let Some((selected, material)) = &highlight.selected
+            && *selected == entity
+        {
+            copy.insert(MeshMaterial3d(material.clone()));
+        }
+    }
+    editor.selected = Some(export);
+    editor.status = format!("Copied; {name} is selected (saved with the map)");
 }
 
 fn save(editor: &mut MapEditor) {
@@ -489,7 +638,7 @@ fn change_placement(
     if placement == before {
         return;
     }
-    editor.undo.push((export, before));
+    editor.undo.push(UndoStep::Moved(export, before));
     editor.set_placement(export, placement);
     apply_placement(parts, scene_origin, export, placement);
 }
@@ -590,6 +739,7 @@ enum EditorAction {
     Rotate(i32),
     Step(f32),
     DropToFloor,
+    Copy,
     Undo,
     Save,
     Close,
@@ -660,7 +810,10 @@ fn spawn_editor_panel(mut commands: Commands) {
         );
         panel_row(
             parent,
-            [("Drop to floor".to_string(), EditorAction::DropToFloor)],
+            [
+                ("Copy".to_string(), EditorAction::Copy),
+                ("Drop to floor".to_string(), EditorAction::DropToFloor),
+            ],
         );
         panel_label(parent, "Rotate");
         panel_row(
@@ -799,6 +952,8 @@ fn show_editor_panel(
 }
 
 fn press_editor_buttons(
+    mut commands: Commands,
+    highlight: Res<SelectionState>,
     actions: Query<(&Interaction, &EditorAction), Changed<Interaction>>,
     camera: Single<&GlobalTransform, With<FlyCamera>>,
     scene: Res<MapScene>,
@@ -816,9 +971,22 @@ fn press_editor_buttons(
             continue;
         }
         match *action {
-            EditorAction::Undo => undo(&mut editor, &mut parts, scene.origin),
+            EditorAction::Undo => undo(&mut commands, &mut editor, &mut parts, scene.origin),
             EditorAction::Save => save(&mut editor),
             EditorAction::Close => editor.selected = None,
+            EditorAction::Copy => {
+                // Beside the original, a few steps to the camera's right.
+                let offset =
+                    nudge_direction(Nudge::Right, &camera) * (editor.step * 4.0).max(64.0);
+                copy_selection(
+                    &mut commands,
+                    &mut editor,
+                    &parts,
+                    &highlight,
+                    scene.origin,
+                    offset,
+                );
+            }
             _ => {}
         }
         let Some(export) = editor.selected else {
@@ -1113,6 +1281,93 @@ mod tests {
             .unwrap();
         assert_eq!(copy.location, Vec3::new(147456.0, 5900.0, 5776.0));
         assert_eq!(copy.rotation, IVec3::new(0, 32768, 0));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn copies_are_numbered_after_the_package_and_undo_removes_them() {
+        let mut editor = editor();
+        editor.base_exports = 20;
+        let placement = Placement {
+            location: Vec3::new(164.0, 200.0, 300.0),
+            rotation: IVec3::new(0, 16384, 0),
+        };
+        assert_eq!(editor.add_copy(7, placement), Some(20));
+        assert_eq!(editor.placement(20), Some(placement));
+        assert_eq!(editor.unsaved_changes(), 1);
+        // Moving the copy changes the actor it saves, not a property edit.
+        editor.set_placement(
+            20,
+            Placement {
+                location: Vec3::ZERO,
+                ..placement
+            },
+        );
+        assert!(editor.property_edits().is_empty());
+
+        assert_eq!(editor.undo.last(), Some(&UndoStep::Added(20)));
+        editor.remove_addition(20);
+        assert!(editor.additions.is_empty());
+        assert_eq!(editor.placement(20), None);
+        assert_eq!(editor.unsaved_changes(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires LINEAGE2_CLIENT to point to a complete client"]
+    fn saving_a_copy_adds_the_actor_to_an_encrypted_lineage_map() {
+        let client = PathBuf::from(
+            std::env::var_os("LINEAGE2_CLIENT").expect("LINEAGE2_CLIENT is not configured"),
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "unreal-viewer-editor-copy-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let map = directory.join("24_18.unr");
+        fs::copy(client.join("Maps/24_18.unr"), &map).unwrap();
+        let (scene, _) = load_scene(&map, &[]).unwrap();
+        let mut editor = MapEditor::new(&map, fs::read(&map).unwrap(), &scene.instances);
+        let gate = scene
+            .instances
+            .iter()
+            .find(|instance| instance.name == "StaticMeshActor1")
+            .and_then(|instance| instance.source)
+            .unwrap();
+        let placement = Placement {
+            location: gate.location + Vec3::new(0.0, 512.0, 0.0),
+            rotation: gate.rotation,
+        };
+        let copy = editor.add_copy(gate.export, placement).unwrap();
+        // Copy a copy, then move the first one: both save in order.
+        let second = editor
+            .add_copy(copy, Placement {
+                location: placement.location + Vec3::new(0.0, 512.0, 0.0),
+                ..placement
+            })
+            .unwrap();
+        let moved = Placement {
+            location: placement.location + Vec3::new(64.0, 0.0, 0.0),
+            ..placement
+        };
+        editor.set_placement(copy, moved);
+        editor.save().unwrap();
+        assert_eq!(editor.unsaved_changes(), 0);
+
+        let (saved, _) = load_scene(&map, &[]).unwrap();
+        assert_eq!(saved.instances.len(), scene.instances.len() + 2);
+        let location = |export| {
+            saved
+                .instances
+                .iter()
+                .find_map(|instance| instance.source.filter(|source| source.export == export))
+                .map(|source| source.location)
+        };
+        assert_eq!(location(copy), Some(moved.location));
+        assert_eq!(
+            location(second),
+            Some(placement.location + Vec3::new(0.0, 512.0, 0.0))
+        );
+        assert_eq!(location(gate.export), Some(gate.location));
         fs::remove_dir_all(directory).unwrap();
     }
 
