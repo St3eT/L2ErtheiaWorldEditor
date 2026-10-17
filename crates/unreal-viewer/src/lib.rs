@@ -2254,6 +2254,24 @@ mod tests {
     }
 
     #[test]
+    fn lineage_static_mesh_actor_subclasses_place_meshes() {
+        let static_mesh = [PropertyDump {
+            name: "StaticMesh".into(),
+            property_type: "Object".into(),
+            array_index: 0,
+            size: 2,
+            value: "Aden_Village_S.Aden_Village_fountain04".into(),
+            raw: String::new(),
+            wire_header: String::new(),
+        }];
+        assert!(places_mesh("Engine.StaticMeshActor", &static_mesh));
+        assert!(places_mesh("Engine.L2MovableStaticMeshActor", &static_mesh));
+        assert!(places_mesh("Engine.Mover", &[]));
+        // Mesh emitters reference a static mesh too but draw it as particles.
+        assert!(!places_mesh("Engine.MeshEmitter", &static_mesh));
+    }
+
+    #[test]
     fn projector_actor_maps_to_a_clustered_decal_volume() {
         let property = |name: &str, value: &str| PropertyDump {
             name: name.into(),

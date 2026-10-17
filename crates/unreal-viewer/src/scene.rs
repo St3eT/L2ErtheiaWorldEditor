@@ -125,12 +125,7 @@ impl MapScene {
                         decals.push(decal);
                     }
                 }
-                _ if matches!(
-                    export.class.as_str(),
-                    "Engine.StaticMeshActor" | "Engine.Mover"
-                ) || property(&export.properties, "Mesh").is_some()
-                    || property(&export.properties, "SkeletalMesh").is_some() =>
-                {
+                _ if places_mesh(&export.class, &export.properties) => {
                     if let Some(instance) = mesh_instance(&export) {
                         actors.push(instance);
                     }
@@ -2085,6 +2080,16 @@ pub(super) fn standard_material(
         },
         ..default()
     }
+}
+
+/// Whether an actor places a mesh in the level. Lineage II adds its own
+/// static mesh actor classes, such as `L2MovableStaticMeshActor` for the
+/// Aden village fountain.
+pub(super) fn places_mesh(class: &str, properties: &[PropertyDump]) -> bool {
+    class.ends_with("StaticMeshActor")
+        || class == "Engine.Mover"
+        || property(properties, "Mesh").is_some()
+        || property(properties, "SkeletalMesh").is_some()
 }
 
 fn mesh_instance(export: &ExportDump) -> Option<MeshInstance> {
