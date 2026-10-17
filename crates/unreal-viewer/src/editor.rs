@@ -113,6 +113,7 @@ struct Addition {
 enum UndoStep {
     Moved(usize, Placement),
     Added(usize),
+    Deleted(usize),
 }
 
 struct Drag {
@@ -142,6 +143,12 @@ pub(super) struct MapEditor {
     base_exports: usize,
     additions: Vec<Addition>,
     saved_additions: Vec<Addition>,
+    /// Actors deleted in the viewer. Added ones (new, or saved earlier by this
+    /// editor) are removed from the package; the map's own actors get
+    /// `bDeleteMe`, which the game honours like Unreal's editor does, since
+    /// other objects may refer to them by index.
+    deleted: BTreeSet<usize>,
+    saved_deleted: BTreeSet<usize>,
     undo: Vec<UndoStep>,
     pub(super) selected: Option<usize>,
     drag: Option<Drag>,
@@ -187,6 +194,8 @@ impl MapEditor {
             base_exports,
             additions: Vec::new(),
             saved_additions: Vec::new(),
+            deleted: BTreeSet::new(),
+            saved_deleted: BTreeSet::new(),
             undo: Vec::new(),
             selected: None,
             drag: None,
@@ -264,6 +273,28 @@ impl MapEditor {
             .take_while(|(addition, saved)| addition == saved)
             .count();
         moved + self.additions.len() + self.saved_additions.len() - 2 * unchanged_additions
+            + self.deleted.symmetric_difference(&self.saved_deleted).count()
+    }
+
+    fn delete(&mut self, export: usize) {
+        if self.actors.contains_key(&export) && self.deleted.insert(export) {
+            self.undo.push(UndoStep::Deleted(export));
+            if self.selected == Some(export) {
+                self.selected = None;
+            }
+        }
+    }
+
+    /// The export an added actor clones once deleted copies are skipped: a
+    /// copy of a deleted copy clones what that copy cloned.
+    fn surviving_template(&self, mut template: usize) -> usize {
+        while template >= self.base_exports && self.deleted.contains(&template) {
+            match self.additions.iter().find(|addition| addition.export == template) {
+                Some(addition) => template = addition.template,
+                None => break,
+            }
+        }
+        template
     }
 
     /// Records a copy of `template` at `placement` and returns the export
@@ -301,10 +332,28 @@ impl MapEditor {
         }
     }
 
+    #[cfg(test)]
     fn property_edits(&self) -> Vec<PropertyEdit> {
+        self.property_edits_keeping(usize::MAX)
+    }
+
+    /// Property edits for the loaded actors; deleted ones from
+    /// `removable_from` on are removed instead of flagged.
+    fn property_edits_keeping(&self, removable_from: usize) -> Vec<PropertyEdit> {
         let mut edits = Vec::new();
+        for &export in self.deleted.range(..self.base_exports.min(removable_from)) {
+            edits.push(PropertyEdit {
+                export,
+                name: "bDeleteMe".into(),
+                property_type: "Bool".into(),
+                value: "true".into(),
+            });
+        }
         // Added actors are written whole with their current placement.
         for (&export, placement) in self.edits.range(..self.base_exports) {
+            if self.deleted.contains(&export) {
+                continue;
+            }
             let actor = &self.actors[&export];
             let mut edit = |name: &str, property_type: &str, value: String| {
                 edits.push(PropertyEdit {
@@ -339,26 +388,51 @@ impl MapEditor {
     /// that was ever overwritten next to it as `<map>.bak`.
     fn save(&mut self) -> Result<PathBuf, String> {
         let mut package = Package::from_wire_bytes(&self.path, self.wire.clone())?;
+        let removable_from = package.added_actor_start();
+        let removed: Vec<usize> = self
+            .deleted
+            .range(removable_from..self.base_exports)
+            .copied()
+            .collect();
+        if self
+            .deleted
+            .range(..self.base_exports.min(removable_from))
+            .next()
+            .is_some()
+        {
+            let named = package.with_names(&["bDeleteMe"])?;
+            package = Package::from_wire_bytes(&self.path, named)?;
+        }
+        // Deleted copies are skipped, so later copies may land on lower export
+        // indices than the viewer numbered them with.
+        let mut saved_as = HashMap::new();
         for addition in &self.additions {
+            if self.deleted.contains(&addition.export) {
+                continue;
+            }
             let placement = self
                 .placement(addition.export)
                 .ok_or("an added actor has no placement")?;
+            let template = self.surviving_template(addition.template);
+            let template = saved_as.get(&template).copied().unwrap_or(template);
             let rotation = placement.rotation;
             let (bytes, export) = package.add_actor(&ActorAddition {
-                template: addition.template,
+                template,
                 static_mesh: None,
                 location: vector_value(placement.location),
                 rotation: format!("{},{},{}", rotation.x, rotation.y, rotation.z),
             })?;
-            if export != addition.export {
-                return Err(format!(
-                    "added actor became export {export}, expected {}",
-                    addition.export
-                ));
-            }
+            saved_as.insert(addition.export, export);
             package = Package::from_wire_bytes(&self.path, bytes)?;
         }
-        let plain = package.rebuild_with_property_edits(&self.property_edits())?;
+        let plain = package.rebuild_with_property_edits(&self.property_edits_keeping(removable_from))?;
+        // Removed last: actors added above may clone the ones removed here,
+        // and removing only renumbers added actors, which nothing refers to.
+        let plain = if removed.is_empty() {
+            plain
+        } else {
+            Package::from_wire_bytes(&self.path, plain)?.remove_added_actors(&removed)?
+        };
         let filename = self
             .path
             .file_name()
@@ -377,6 +451,7 @@ impl MapEditor {
             .map_err(|error| format!("cannot replace {}: {error}", self.path.display()))?;
         self.saved = self.edits.clone();
         self.saved_additions = self.additions.clone();
+        self.saved_deleted = self.deleted.clone();
         Ok(backup)
     }
 }
@@ -609,19 +684,58 @@ fn editor_shortcuts(
     scene: Res<MapScene>,
     mut editor: ResMut<MapEditor>,
     mut parts: Query<(Entity, &mut Transform, &mut SelectableObject)>,
+    mut visibility: Query<&mut Visibility>,
 ) {
-    if menus_open(&view) || editor.is_dragging() {
+    if menus_open(&view) || editor.is_dragging() || editor.typing_in_browser() {
         return;
     }
     let keys = &view.keys;
+    if keys.just_pressed(KeyCode::Delete) {
+        delete_selection(&mut editor, &parts, &mut visibility);
+    }
     if !(keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight)) {
         return;
     }
     if keys.just_pressed(KeyCode::KeyZ) {
-        undo(&mut commands, &mut editor, &mut parts, scene.origin);
+        undo(&mut commands, &mut editor, &mut parts, &mut visibility, scene.origin);
     }
     if keys.just_pressed(KeyCode::KeyS) {
         save(&mut editor);
+    }
+}
+
+fn set_actor_visible(
+    parts: &Query<(Entity, &mut Transform, &mut SelectableObject)>,
+    visibility: &mut Query<&mut Visibility>,
+    export: usize,
+    visible: bool,
+) {
+    for (entity, _, object) in parts.iter() {
+        if object.export == Some(export)
+            && let Ok(mut shown) = visibility.get_mut(entity)
+        {
+            *shown = if visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+        }
+    }
+}
+
+fn delete_selection(
+    editor: &mut MapEditor,
+    parts: &Query<(Entity, &mut Transform, &mut SelectableObject)>,
+    visibility: &mut Query<&mut Visibility>,
+) {
+    let Some(export) = editor.selected else {
+        return;
+    };
+    let name = editor.actors.get(&export).map(|actor| actor.name.clone());
+    editor.delete(export);
+    set_actor_visible(parts, visibility, export, false);
+    if let Some(name) = name {
+        editor.status = format!("Deleted {name} (Undo brings it back)");
     }
 }
 
@@ -629,6 +743,7 @@ fn undo(
     commands: &mut Commands,
     editor: &mut MapEditor,
     parts: &mut Query<(Entity, &mut Transform, &mut SelectableObject)>,
+    visibility: &mut Query<&mut Visibility>,
     scene_origin: Vec3,
 ) {
     match editor.undo.pop() {
@@ -637,6 +752,12 @@ fn undo(
             apply_placement(parts, scene_origin, export, placement);
             editor.selected = Some(export);
             editor.status = "Undone".into();
+        }
+        Some(UndoStep::Deleted(export)) => {
+            editor.deleted.remove(&export);
+            set_actor_visible(parts, visibility, export, true);
+            editor.selected = Some(export);
+            editor.status = "Restored the deleted actor".into();
         }
         Some(UndoStep::Added(export)) => {
             for (entity, _, object) in parts.iter() {
@@ -876,6 +997,7 @@ enum EditorAction {
     Step(f32),
     DropToFloor,
     Copy,
+    Delete,
     ToggleBrowser,
     Place(usize),
     Undo,
@@ -952,6 +1074,7 @@ fn spawn_editor_panel(mut commands: Commands) {
             [
                 ("Copy".to_string(), EditorAction::Copy),
                 ("Drop to floor".to_string(), EditorAction::DropToFloor),
+                ("Delete".to_string(), EditorAction::Delete),
             ],
         );
         panel_label(parent, "Rotate");
@@ -1311,6 +1434,7 @@ fn press_editor_buttons(
     mut ray_cast: MeshRayCast,
     mut parts: Query<(Entity, &mut Transform, &mut SelectableObject)>,
     bounds: Query<(&Aabb, &GlobalTransform)>,
+    mut visibility: Query<&mut Visibility>,
 ) {
     for (interaction, action) in &actions {
         if *interaction != Interaction::Pressed {
@@ -1321,7 +1445,14 @@ fn press_editor_buttons(
             continue;
         }
         match *action {
-            EditorAction::Undo => undo(&mut commands, &mut editor, &mut parts, scene.origin),
+            EditorAction::Undo => undo(
+                &mut commands,
+                &mut editor,
+                &mut parts,
+                &mut visibility,
+                scene.origin,
+            ),
+            EditorAction::Delete => delete_selection(&mut editor, &parts, &mut visibility),
             EditorAction::Save => save(&mut editor),
             EditorAction::Close => editor.selected = None,
             EditorAction::ToggleBrowser => editor.browser_open = !editor.browser_open,
@@ -1446,7 +1577,7 @@ fn editor_summary(editor: &MapEditor) -> String {
         count => format!("{count} unsaved changes"),
     };
     let mut summary = format!(
-        "EDITOR - {changes}\nClick a placed mesh to edit it; drag it to move, mouse wheel or Alt+drag for height. Ctrl+Z undo, Ctrl+S save."
+        "EDITOR - {changes}\nClick a placed mesh to edit it; drag it to move, mouse wheel or Alt+drag for height. Delete removes it. Ctrl+Z undo, Ctrl+S save."
     );
     if !editor.status.is_empty() {
         summary.push('\n');
@@ -1789,6 +1920,100 @@ mod tests {
         assert_eq!(editor.matching_catalog(), [0]);
         editor.search.clear();
         assert_eq!(editor.matching_catalog(), [0, 1]);
+    }
+
+    #[test]
+    fn deleting_a_saved_actor_flags_it_and_a_copy_is_just_dropped() {
+        let mut editor = editor();
+        editor.base_exports = 20;
+        let original = editor.placement(7).unwrap();
+        let copy = editor.add_copy(7, original).unwrap();
+        let copy_of_copy = editor.add_copy(copy, original).unwrap();
+        editor.selected = Some(7);
+        editor.delete(7);
+        editor.delete(copy);
+        assert_eq!(editor.selected, None);
+        let edits = editor.property_edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            (edits[0].export, edits[0].name.as_str(), edits[0].value.as_str()),
+            (7, "bDeleteMe", "true")
+        );
+        // The surviving copy clones what the deleted copy cloned.
+        assert_eq!(editor.surviving_template(copy), 7);
+        assert_eq!(editor.surviving_template(copy_of_copy), copy_of_copy);
+        assert_eq!(editor.undo.last(), Some(&UndoStep::Deleted(copy)));
+    }
+
+    #[test]
+    #[ignore = "requires LINEAGE2_CLIENT to point to a complete client"]
+    fn saving_a_deletion_hides_the_actor_from_the_lineage_map() {
+        let client = PathBuf::from(
+            std::env::var_os("LINEAGE2_CLIENT").expect("LINEAGE2_CLIENT is not configured"),
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "unreal-viewer-editor-delete-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let map = directory.join("24_18.unr");
+        fs::copy(client.join("Maps/24_18.unr"), &map).unwrap();
+        let (scene, _) = load_scene(&map, &[]).unwrap();
+        let mut editor = MapEditor::new(&map, fs::read(&map).unwrap(), &scene.instances);
+        let gate = scene
+            .instances
+            .iter()
+            .find(|instance| instance.name == "StaticMeshActor1")
+            .and_then(|instance| instance.source)
+            .unwrap();
+        let copy = editor
+            .add_copy(gate.export, Placement {
+                location: gate.location + Vec3::new(0.0, 512.0, 0.0),
+                rotation: gate.rotation,
+            })
+            .unwrap();
+        let kept = editor
+            .add_copy(copy, Placement {
+                location: gate.location + Vec3::new(0.0, 1024.0, 0.0),
+                rotation: gate.rotation,
+            })
+            .unwrap();
+        editor.delete(gate.export);
+        editor.delete(copy);
+        editor.save().unwrap();
+
+        let (saved, _) = load_scene(&map, &[]).unwrap();
+        // The gate is gone, the deleted copy never written, the other copy
+        // saved as the next export.
+        assert_eq!(saved.instances.len(), scene.instances.len());
+        assert!(
+            !saved
+                .instances
+                .iter()
+                .any(|instance| instance.source.is_some_and(|source| source.export == gate.export))
+        );
+        let added = saved
+            .instances
+            .iter()
+            .find_map(|instance| {
+                instance
+                    .source
+                    .filter(|source| source.export == editor.base_exports)
+            })
+            .unwrap();
+        assert_eq!(added.location, gate.location + Vec3::new(0.0, 1024.0, 0.0));
+        assert!(kept > editor.base_exports);
+
+        // Reopened, the saved copy is an added actor and is removed outright.
+        let mut reopened = MapEditor::new(&map, fs::read(&map).unwrap(), &saved.instances);
+        let exports_before = reopened.base_exports;
+        reopened.delete(added.export);
+        reopened.save().unwrap();
+        let package = Package::read(&map).unwrap();
+        assert_eq!(package.export_count(), exports_before - 1);
+        let (reloaded, _) = load_scene(&map, &[]).unwrap();
+        assert_eq!(reloaded.instances.len(), scene.instances.len() - 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

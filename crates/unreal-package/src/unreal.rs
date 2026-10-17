@@ -206,6 +206,24 @@ impl Package {
         Ok(data)
     }
 
+    /// The package with any of `names` that it lacks appended to its name
+    /// table, so property edits may use them. Existing indices are unchanged.
+    pub fn with_names(&self, names: &[&str]) -> Result<Vec<u8>, String> {
+        let mut table = self.names.clone();
+        for name in names {
+            ensure_name(&mut table, name, "0x00070010")?;
+        }
+        if table.len() == self.names.len() {
+            return Ok(self.data.clone());
+        }
+        self.rebuild_tables(
+            self.data.clone(),
+            table,
+            self.imports.clone(),
+            self.exports.clone(),
+        )
+    }
+
     /// Rebuilds the package with tagged property values replaced, adding a
     /// property to its export when the export does not serialize it yet.
     pub fn rebuild_with_property_edits(&self, edits: &[PropertyEdit]) -> Result<Vec<u8>, String> {
@@ -354,6 +372,70 @@ impl Package {
         Ok((bytes, new_index))
     }
 
+    /// The index of the first of the trailing exports that are actors added
+    /// by [`Package::add_actor`]: static mesh actors without per-actor lighting
+    /// (a StaticMeshInstance) or native data. Nothing in the package refers
+    /// to them, so they can be removed outright and renumbered.
+    pub fn added_actor_start(&self) -> usize {
+        let mut start = self.exports.len();
+        while let Some(index) = start.checked_sub(1) {
+            let export = &self.exports[index];
+            if !self.object_path(export.class.reference).ends_with("StaticMeshActor") {
+                break;
+            }
+            let dump = self.export_dump(index, export);
+            if dump.raw_data.is_some()
+                || dump.native_object.is_some()
+                || !dump.unread_data.is_empty()
+                || dump
+                    .properties
+                    .iter()
+                    .any(|property| property.name == "StaticMeshInstance")
+            {
+                break;
+            }
+            start = index;
+        }
+        start
+    }
+
+    /// Removes added actors (see [`Package::added_actor_start`]) from the
+    /// export table; the actors after them move down. Their payload bytes are
+    /// left unreferenced in the file.
+    pub fn remove_added_actors(&self, removed: &[usize]) -> Result<Vec<u8>, String> {
+        let start = self.added_actor_start();
+        if let Some(index) = removed
+            .iter()
+            .find(|index| **index < start || **index >= self.exports.len())
+        {
+            return Err(format!(
+                "export {index} is not an added actor and cannot be removed outright"
+            ));
+        }
+        for export in &self.exports[..start] {
+            for reference in [export.class.reference, export.super_class.reference, export.outer] {
+                if let ObjectRef::Export(target) = reference
+                    && target.get() >= start
+                {
+                    return Err("an added actor is referenced by the export table".into());
+                }
+            }
+        }
+        let exports = self
+            .exports
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !removed.contains(index))
+            .map(|(_, export)| export.clone())
+            .collect();
+        self.rebuild_tables(
+            self.data.clone(),
+            self.names.clone(),
+            self.imports.clone(),
+            exports,
+        )
+    }
+
     /// Replaces or adds a tagged property of a dump being encoded as a new
     /// export, encoding its raw value from `value`.
     fn set_property(
@@ -439,6 +521,9 @@ impl Package {
         };
         if let Some(original) = original.filter(|original| {
             !original.wire_header.is_empty()
+                // A boolean's value lives in its tag, so a changed one needs
+                // a new tag.
+                && !(kind == 3 && original.value != property.value)
                 && original.name == property.name
                 && original.property_type == property.property_type
                 && original.array_index == property.array_index
@@ -478,6 +563,8 @@ impl Package {
             1 => Ok(vec![
                 property.value.parse::<u8>().map_err(|e| e.to_string())?,
             ]),
+            // Stored in the tag's array flag; the value itself has no bytes.
+            3 => Ok(Vec::new()),
             2 => Ok(property
                 .value
                 .parse::<i32>()
@@ -2632,6 +2719,49 @@ mod tests {
     }
 
     #[test]
+    fn added_actors_can_be_removed_outright_and_the_rest_move_down() {
+        let package =
+            Package::from_wire_bytes(Path::new("map.unr"), map_test_package()).unwrap();
+        // The original actor has per-actor lighting, so it is not removable.
+        assert_eq!(package.added_actor_start(), 2);
+        let mut bytes = map_test_package();
+        for x in ["1", "2", "3"] {
+            let package = Package::from_wire_bytes(Path::new("map.unr"), bytes).unwrap();
+            bytes = package
+                .add_actor(&ActorAddition {
+                    template: 0,
+                    static_mesh: None,
+                    location: format!("{x},0,0"),
+                    rotation: "0,0,0".into(),
+                })
+                .unwrap()
+                .0;
+        }
+        let package = Package::from_wire_bytes(Path::new("map.unr"), bytes).unwrap();
+        assert_eq!(package.added_actor_start(), 2);
+        assert!(package.remove_added_actors(&[0]).is_err());
+
+        let removed = package.remove_added_actors(&[3]).unwrap();
+        let dump = Package::from_wire_bytes(Path::new("map.unr"), removed)
+            .unwrap()
+            .dump();
+        let locations: Vec<_> = dump.exports[2..]
+            .iter()
+            .map(|export| {
+                export
+                    .properties
+                    .iter()
+                    .find(|property| property.name == "Location")
+                    .unwrap()
+                    .value
+                    .clone()
+            })
+            .collect();
+        assert_eq!(locations, ["1,0,0", "3,0,0"]);
+        assert_eq!(dump.exports[0].name, "StaticMeshActor7");
+    }
+
+    #[test]
     fn new_actor_names_continue_the_highest_numbered_name() {
         let names: Vec<_> = ["StaticMeshActor", "staticmeshactor2017", "StaticMeshActor9", "Light4"]
             .into_iter()
@@ -2643,6 +2773,42 @@ mod tests {
         assert_eq!(unique_actor_name(&names, "StaticMeshActor9"), "StaticMeshActor2018");
         assert_eq!(unique_actor_name(&names, "Light4"), "Light5");
         assert_eq!(unique_actor_name(&names, "Emitter3"), "Emitter0");
+    }
+
+    #[test]
+    fn boolean_flags_can_be_added_and_changed() {
+        let package =
+            Package::from_wire_bytes(Path::new("test.unr"), actor_test_package()).unwrap();
+        let named = package.with_names(&["bDeleteMe"]).unwrap();
+        let package = Package::from_wire_bytes(Path::new("test.unr"), named).unwrap();
+        let flag = |value: &str| PropertyEdit {
+            export: 0,
+            name: "bDeleteMe".into(),
+            property_type: "Bool".into(),
+            value: value.into(),
+        };
+        let deleted = package.rebuild_with_property_edits(&[flag("true")]).unwrap();
+        let package = Package::from_wire_bytes(Path::new("test.unr"), deleted).unwrap();
+        let value = |package: &Package| {
+            package.dump().exports[0]
+                .properties
+                .iter()
+                .find(|property| property.name == "bDeleteMe")
+                .map(|property| property.value.clone())
+        };
+        assert_eq!(value(&package).as_deref(), Some("true"));
+        assert_eq!(location(&package), "147456,5391.995,5776");
+
+        let restored = package.rebuild_with_property_edits(&[flag("false")]).unwrap();
+        let package = Package::from_wire_bytes(Path::new("test.unr"), restored).unwrap();
+        assert_eq!(value(&package).as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn names_already_present_leave_the_package_unchanged() {
+        let bytes = actor_test_package();
+        let package = Package::from_wire_bytes(Path::new("test.unr"), bytes.clone()).unwrap();
+        assert_eq!(package.with_names(&["location", "None"]).unwrap(), bytes);
     }
 
     #[test]
