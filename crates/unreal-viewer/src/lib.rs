@@ -28,6 +28,7 @@ use unreal_package::native::{
 };
 use unreal_package::unreal::{ExportDump, Package, PropertyDump};
 
+mod capture;
 mod combiner;
 mod editor;
 mod particles;
@@ -36,6 +37,7 @@ mod runtime;
 mod scene;
 mod terrain;
 
+pub use capture::ViewOptions;
 use presentation::ViewerPresentationPlugin;
 use runtime::ViewerRuntimePlugin;
 use scene::{asset_roots, texture_geometry};
@@ -53,8 +55,8 @@ fn selectable_mesh_usage() -> RenderAssetUsages {
     RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD
 }
 
-pub fn run(path: &Path, asset_paths: &[PathBuf]) -> Result<(), String> {
-    if let Some(next) = run_map(path, asset_paths)? {
+pub fn run(path: &Path, asset_paths: &[PathBuf], options: ViewOptions) -> Result<(), String> {
+    if let Some(next) = run_map(path, asset_paths, options)? {
         let executable = std::env::current_exe()
             .map_err(|error| format!("cannot locate viewer executable: {error}"))?;
         let mut command = std::process::Command::new(executable);
@@ -69,7 +71,11 @@ pub fn run(path: &Path, asset_paths: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
-fn run_map(path: &Path, asset_paths: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+fn run_map(
+    path: &Path,
+    asset_paths: &[PathBuf],
+    options: ViewOptions,
+) -> Result<Option<PathBuf>, String> {
     let (scene, load_report) = load_scene(path, asset_paths)?;
     report_scene(&scene, &load_report);
     let maps_dir = path
@@ -95,6 +101,7 @@ fn run_map(path: &Path, asset_paths: &[PathBuf]) -> Result<Option<PathBuf>, Stri
     let mut app = App::new();
     app.insert_resource(scene)
         .insert_resource(editor)
+        .insert_resource(capture::ViewRequest(options))
         .insert_resource(MapNavigation {
             maps_dir,
             radar,
@@ -113,6 +120,7 @@ fn run_map(path: &Path, asset_paths: &[PathBuf]) -> Result<Option<PathBuf>, Stri
         .add_plugins(ViewerPresentationPlugin)
         .add_plugins(ViewerRuntimePlugin)
         .add_plugins(editor::MapEditorPlugin)
+        .add_plugins(capture::CapturePlugin)
         .run();
     let selected = take_next_map(&next_map)?;
     Ok(selected)
@@ -2584,3 +2592,4 @@ mod tests {
         );
     }
 }
+
